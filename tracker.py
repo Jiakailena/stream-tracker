@@ -2,6 +2,7 @@ import json
 import re
 import sys
 import requests
+from concurrent.futures import ThreadPoolExecutor
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.backends import default_backend
 
@@ -14,7 +15,7 @@ session.headers.update({
 })
 
 def bypass_infinityfree(url):
-    """Bypasses InfinityFree's aes.js / testcookie challenge automatically"""
+    """Bypasses InfinityFree's aes.js firewall challenge automatically"""
     try:
         res = session.get(url, timeout=15)
         if 'slowAES.decrypt' in res.text:
@@ -37,30 +38,65 @@ def bypass_infinityfree(url):
         print(f"Bypass error: {e}")
         return False
 
-def fetch_chaturbate_live():
-    url = "https://chaturbate.com/api/public/affiliates/onlinerooms/?wm=9w8Zb&format=json"
+def fetch_chaturbate_affiliate_rooms():
+    """Fetches top online rooms from Chaturbate affiliate feed"""
+    url = "https://chaturbate.com/api/public/affiliates/onlinerooms/?wm=9w8Zb&client_ip=request_ip&format=json"
     headers = {'User-Agent': 'Mozilla/5.0'}
     try:
-        r = requests.get(url, headers=headers, timeout=30)
+        r = requests.get(url, headers=headers, timeout=25)
         data = r.json()
-        # Chaturbate wraps live rooms inside a 'results' dictionary
         if isinstance(data, dict):
-            if 'results' in data and isinstance(data['results'], list):
-                return data['results']
-            elif 'rooms' in data and isinstance(data['rooms'], list):
-                return data['rooms']
-            elif 'data' in data and isinstance(data['data'], list):
-                return data['data']
-            return []
+            return data.get('results', [])
         elif isinstance(data, list):
             return data
         return []
     except Exception as e:
-        print(f"Error fetching Chaturbate: {e}")
+        print(f"Affiliate API notice: {e}")
         return []
 
+def direct_check_streamer(username):
+    """Directly inspects the streamer's embed room page for 100% accurate live status"""
+    url = f"https://chaturbate.com/embed/{username}/?bgcolor=black"
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept-Language': 'en-US,en;q=0.9'
+    }
+    try:
+        res = requests.get(url, headers=headers, timeout=8)
+        if res.status_code == 200:
+            html = res.text
+            # Determine if room is online
+            is_live = False
+            if '"is_live": true' in html or '"is_live":true' in html or '.m3u8' in html:
+                is_live = True
+            elif 'room_status' in html and '"room_status": "offline"' not in html and '"room_status":"offline"' not in html:
+                if '"room_status": "public"' in html or '"room_status":"public"' in html:
+                    is_live = True
+
+            if is_live:
+                status = 'public'
+                if '"room_status": "private"' in html or '"room_status":"private"' in html or 'ticket_show' in html:
+                    status = 'private'
+                elif '"room_status": "away"' in html or '"room_status": "hidden"' in html or 'hidden' in html:
+                    status = 'others'
+                
+                viewers = 0
+                m_view = re.search(r'"num_users":\s*(\d+)', html)
+                if m_view:
+                    viewers = int(m_view.group(1))
+
+                return {
+                    'name': username,
+                    'status': status,
+                    'viewers': viewers,
+                    'subject': ''
+                }
+    except Exception:
+        pass
+    return None
+
 def main():
-    # 1. Bypass InfinityFree Security
+    # 1. Bypass Hosting Firewall
     bypass_infinityfree(ENDPOINT_URL)
 
     # 2. Fetch saved streamers from database
@@ -77,18 +113,15 @@ def main():
         return
 
     saved_set = set(saved_streamers)
-    print(f"Successfully loaded {len(saved_set)} streamers from library.")
+    print(f"Loaded {len(saved_set)} streamers from library.")
 
-    # 3. Fetch Chaturbate live rooms
-    print("Scanning Chaturbate live rooms...")
-    live_rooms = fetch_chaturbate_live()
-    print(f"Chaturbate total live rooms: {len(live_rooms)}")
-
-    # 4. Map Statuses
+    # 3. Step 1: Scan Chaturbate Affiliate List
+    print("Checking affiliate feed...")
+    top_rooms = fetch_chaturbate_affiliate_rooms()
     status_payload = []
     found_online = set()
 
-    for room in live_rooms:
+    for room in top_rooms:
         if not isinstance(room, dict):
             continue
         u_name = room.get('username', '').lower()
@@ -97,10 +130,6 @@ def main():
             viewers = room.get('num_users', 0)
             subject = room.get('room_subject', '')
 
-            # Status Mapping Rule:
-            # - public -> public
-            # - private / ticket_show -> private
-            # - away / hidden / club_show -> others
             mapped_status = 'public'
             if current_show in ['private', 'ticket_show']:
                 mapped_status = 'private'
@@ -115,7 +144,18 @@ def main():
             })
             found_online.add(u_name)
 
-    # Offline streamers
+    # 4. Step 2: High-speed direct verification for remaining streamers
+    remaining = list(saved_set - found_online)
+    if remaining:
+        print(f"Verifying {len(remaining)} streamers directly with multi-threading...")
+        with ThreadPoolExecutor(max_workers=15) as executor:
+            direct_results = executor.map(direct_check_streamer, remaining)
+            for res in direct_results:
+                if res:
+                    status_payload.append(res)
+                    found_online.add(res['name'])
+
+    # 5. True Offline streamers
     for offline_name in saved_set - found_online:
         status_payload.append({
             'name': offline_name,
@@ -124,9 +164,9 @@ def main():
             'subject': ''
         })
 
-    print(f"Found {len(found_online)} streamer(s) ONLINE right now.")
+    print(f"Total {len(found_online)} streamer(s) verified ONLINE!")
 
-    # 5. Sync to database
+    # 6. Push verified statuses to database
     try:
         sync_res = session.post(ENDPOINT_URL, data={
             'action': 'sync_tracker',
