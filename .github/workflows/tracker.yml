@@ -17,6 +17,9 @@ jobs:
         with:
           python-version: '3.11'
 
+      - name: Install Dependencies
+        run: pip install requests cryptography
+
       - name: Run Tracker
         run: python tracker.py
         
