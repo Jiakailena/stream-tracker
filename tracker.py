@@ -1,45 +1,80 @@
 import json
-import urllib.request
-import urllib.parse
+import re
 import sys
+import requests
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.backends import default_backend
 
 ENDPOINT_URL = "https://stacy.infinityfreeapp.com/stream.php"
 TRACKER_SECRET = "jitul_tracker_key_2026"
 
+session = requests.Session()
+session.headers.update({
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+})
+
+def bypass_infinityfree(url):
+    """Bypasses InfinityFree's aes.js / testcookie challenge automatically"""
+    try:
+        res = session.get(url, timeout=15)
+        if 'slowAES.decrypt' in res.text:
+            print("Detected InfinityFree firewall challenge. Solving security cookie...")
+            matches = re.findall(r'toNumbers\("([0-9a-fA-F]+)"\)', res.text)
+            if len(matches) >= 3:
+                a_key = bytes.fromhex(matches[0])
+                b_iv = bytes.fromhex(matches[1])
+                c_cipher = bytes.fromhex(matches[2])
+
+                cipher = Cipher(algorithms.AES(a_key), modes.CBC(b_iv), backend=default_backend())
+                decryptor = cipher.decryptor()
+                cookie_val = (decryptor.update(c_cipher) + decryptor.finalize()).hex()
+
+                session.cookies.set('__test', cookie_val, domain='stacy.infinityfreeapp.com', path='/')
+                print(f"Firewall bypassed successfully! __test cookie set.")
+                return True
+        return True
+    except Exception as e:
+        print(f"Bypass error: {e}")
+        return False
+
 def fetch_chaturbate_live():
     url = "https://chaturbate.com/api/public/affiliates/onlinerooms/?wm=9w8Zb&format=json"
-    req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+    headers = {'User-Agent': 'Mozilla/5.0'}
     try:
-        with urllib.request.urlopen(req, timeout=30) as res:
-            return json.loads(res.read().decode('utf-8'))
+        r = requests.get(url, headers=headers, timeout=30)
+        return r.json()
     except Exception as e:
         print(f"Error fetching Chaturbate: {e}")
         return []
 
 def main():
-    fetch_req = urllib.request.Request(
-        ENDPOINT_URL,
-        data=urllib.parse.urlencode({'action': 'load_all'}).encode('utf-8'),
-        headers={'User-Agent': 'Mozilla/5.0'}
-    )
+    # 1. Bypass InfinityFree Security
+    bypass_infinityfree(ENDPOINT_URL)
+
+    # 2. Fetch saved streamers from database
     try:
-        with urllib.request.urlopen(fetch_req, timeout=15) as res:
-            site_data = json.loads(res.read().decode('utf-8'))
-            saved_streamers = [s['name'].lower() for s in site_data.get('streamers', [])]
+        res = session.post(ENDPOINT_URL, data={'action': 'load_all'}, timeout=15)
+        site_data = res.json()
+        saved_streamers = [s['name'].lower() for s in site_data.get('streamers', [])]
     except Exception as e:
         print(f"Failed to load streamers: {e}")
+        if 'res' in locals():
+            print(f"Raw response: {res.text[:200]}")
         return
 
     if not saved_streamers:
-        print("No saved streamers found.")
+        print("No saved streamers found in library.")
         return
 
     saved_set = set(saved_streamers)
-    print(f"Checking {len(saved_set)} saved streamers...")
+    print(f"Successfully loaded {len(saved_set)} streamers from library.")
 
+    # 3. Fetch Chaturbate live rooms
+    print("Scanning Chaturbate live rooms...")
     live_rooms = fetch_chaturbate_live()
     print(f"Chaturbate total live rooms: {len(live_rooms)}")
 
+    # 4. Map Statuses
     status_payload = []
     found_online = set()
 
@@ -64,6 +99,7 @@ def main():
             })
             found_online.add(u_name)
 
+    # Offline streamers
     for offline_name in saved_set - found_online:
         status_payload.append({
             'name': offline_name,
@@ -72,20 +108,21 @@ def main():
             'subject': ''
         })
 
-    post_data = urllib.parse.urlencode({
-        'action': 'sync_tracker',
-        'secret': TRACKER_SECRET,
-        'payload': json.dumps(status_payload)
-    }).encode('utf-8')
+    print(f"Found {len(found_online)} streamer(s) ONLINE right now.")
 
-    sync_req = urllib.request.Request(ENDPOINT_URL, data=post_data, headers={'User-Agent': 'Mozilla/5.0'})
+    # 5. Sync to database
     try:
-        with urllib.request.urlopen(sync_req, timeout=20) as res:
-            result = json.loads(res.read().decode('utf-8'))
-            print("Sync Result:", result)
+        sync_res = session.post(ENDPOINT_URL, data={
+            'action': 'sync_tracker',
+            'secret': TRACKER_SECRET,
+            'payload': json.dumps(status_payload)
+        }, timeout=20)
+        print("Database Sync Result:", sync_res.json())
     except Exception as e:
         print(f"Sync error: {e}")
+        if 'sync_res' in locals():
+            print(f"Raw sync response: {sync_res.text[:200]}")
 
 if __name__ == '__main__':
     main()
-  
+    
