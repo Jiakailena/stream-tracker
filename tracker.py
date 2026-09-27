@@ -30,7 +30,7 @@ def bypass_infinityfree(url):
                 cookie_val = (decryptor.update(c_cipher) + decryptor.finalize()).hex()
 
                 session.cookies.set('__test', cookie_val, domain='stacy.infinityfreeapp.com', path='/')
-                print(f"Firewall bypassed successfully! __test cookie set.")
+                print("Firewall bypassed successfully! __test cookie set.")
                 return True
         return True
     except Exception as e:
@@ -42,7 +42,19 @@ def fetch_chaturbate_live():
     headers = {'User-Agent': 'Mozilla/5.0'}
     try:
         r = requests.get(url, headers=headers, timeout=30)
-        return r.json()
+        data = r.json()
+        # Chaturbate wraps live rooms inside a 'results' dictionary
+        if isinstance(data, dict):
+            if 'results' in data and isinstance(data['results'], list):
+                return data['results']
+            elif 'rooms' in data and isinstance(data['rooms'], list):
+                return data['rooms']
+            elif 'data' in data and isinstance(data['data'], list):
+                return data['data']
+            return []
+        elif isinstance(data, list):
+            return data
+        return []
     except Exception as e:
         print(f"Error fetching Chaturbate: {e}")
         return []
@@ -58,8 +70,6 @@ def main():
         saved_streamers = [s['name'].lower() for s in site_data.get('streamers', [])]
     except Exception as e:
         print(f"Failed to load streamers: {e}")
-        if 'res' in locals():
-            print(f"Raw response: {res.text[:200]}")
         return
 
     if not saved_streamers:
@@ -79,12 +89,18 @@ def main():
     found_online = set()
 
     for room in live_rooms:
+        if not isinstance(room, dict):
+            continue
         u_name = room.get('username', '').lower()
         if u_name in saved_set:
             current_show = room.get('current_show', 'public').lower()
             viewers = room.get('num_users', 0)
             subject = room.get('room_subject', '')
 
+            # Status Mapping Rule:
+            # - public -> public
+            # - private / ticket_show -> private
+            # - away / hidden / club_show -> others
             mapped_status = 'public'
             if current_show in ['private', 'ticket_show']:
                 mapped_status = 'private'
@@ -120,8 +136,6 @@ def main():
         print("Database Sync Result:", sync_res.json())
     except Exception as e:
         print(f"Sync error: {e}")
-        if 'sync_res' in locals():
-            print(f"Raw sync response: {sync_res.text[:200]}")
 
 if __name__ == '__main__':
     main()
