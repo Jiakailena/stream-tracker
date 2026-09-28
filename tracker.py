@@ -3,6 +3,8 @@ import re
 import sys
 import time
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util import Retry
 from concurrent.futures import ThreadPoolExecutor
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.backends import default_backend
@@ -10,15 +12,21 @@ from cryptography.hazmat.backends import default_backend
 ENDPOINT_URL = "https://stacy.infinityfreeapp.com/stream.php"
 TRACKER_SECRET = "jitul_tracker_key_2026"
 
+# High-Performance Session with Connection Pooling
 session = requests.Session()
+adapter = HTTPAdapter(pool_connections=40, pool_maxsize=40, max_retries=Retry(total=1, backoff_factor=0.2))
+session.mount('https://', adapter)
+session.mount('http://', adapter)
+
 session.headers.update({
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    'Accept-Language': 'en-US,en;q=0.9'
 })
 
 def bypass_infinityfree(url):
     """Bypasses InfinityFree's aes.js firewall automatically"""
     try:
-        res = session.get(url, timeout=15)
+        res = session.get(url, timeout=12)
         if 'slowAES.decrypt' in res.text:
             matches = re.findall(r'toNumbers\("([0-9a-fA-F]+)"\)', res.text)
             if len(matches) >= 3:
@@ -38,42 +46,64 @@ def bypass_infinityfree(url):
         print(f"Bypass error: {e}")
         return False
 
-def direct_check_streamer(username):
-    """Direct high-speed room verification via public embed endpoint"""
+def fast_check_streamer(username):
+    """
+    Ultra-fast status checker using 64KB early stream reading 
+    and exact regex targeting.
+    """
     url = f"https://chaturbate.com/embed/{username}/?bgcolor=black"
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept-Language': 'en-US,en;q=0.9'
-    }
     try:
-        res = requests.get(url, headers=headers, timeout=8)
-        if res.status_code == 200:
-            html = res.text
-            is_live = False
-            if '"is_live": true' in html or '"is_live":true' in html or '.m3u8' in html:
-                is_live = True
-            elif 'room_status' in html and '"room_status": "offline"' not in html and '"room_status":"offline"' not in html:
-                if '"room_status": "public"' in html or '"room_status":"public"' in html:
-                    is_live = True
+        # Stream=True downloads only what we need instead of full page
+        with session.get(url, timeout=6, stream=True) as res:
+            if res.status_code != 200:
+                return None
+            
+            # Read first 65KB chunk where room_status JSON is located
+            chunk = res.raw.read(65536)
+            html = chunk.decode('utf-8', errors='ignore')
 
-            if is_live:
-                status = 'public'
-                if '"room_status": "private"' in html or '"room_status":"private"' in html or 'ticket_show' in html:
-                    status = 'private'
-                elif '"room_status": "away"' in html or '"room_status": "hidden"' in html or 'hidden' in html or 'group_show' in html:
-                    status = 'others'
+            # 1. Exact room_status regex extraction
+            status_match = re.search(r'["\']room_status["\']\s*:\s*["\']([a-zA-Z0-9_-]+)["\']', html)
+            
+            if status_match:
+                raw_status = status_match.group(1).lower()
+                
+                # Check for explicit offline
+                if raw_status in ['offline', 'disabled']:
+                    return None
+                
+                # Precise Status Mapping
+                if raw_status in ['private', 'ticket_show', 'vip']:
+                    mapped_status = 'private'
+                elif raw_status in ['away', 'hidden', 'group_show', 'club_show']:
+                    mapped_status = 'others'
+                else:
+                    mapped_status = 'public'
+            else:
+                # Fallback: Check if active HLS video playlist exists
+                if '.m3u8' in html or '"is_live": true' in html or '"is_live":true' in html:
+                    mapped_status = 'public'
+                else:
+                    return None
 
-                viewers = 0
-                m_view = re.search(r'"num_users":\s*(\d+)', html)
-                if m_view:
-                    viewers = int(m_view.group(1))
+            # Extract viewer count safely
+            viewers = 0
+            m_view = re.search(r'["\']num_users["\']\s*:\s*(\d+)', html)
+            if m_view:
+                viewers = int(m_view.group(1))
 
-                return {
-                    'name': username,
-                    'status': status,
-                    'viewers': viewers,
-                    'subject': ''
-                }
+            # Extract topic/subject if available
+            subject = ''
+            m_sub = re.search(r'["\']room_subject["\']\s*:\s*["\']([^"\']*)["\']', html)
+            if m_sub:
+                subject = m_sub.group(1)
+
+            return {
+                'name': username,
+                'status': mapped_status,
+                'viewers': viewers,
+                'subject': subject
+            }
     except Exception:
         pass
     return None
@@ -96,20 +126,24 @@ def main():
         return
 
     saved_set = [s['name'].lower() for s in raw_streamers]
-    print(f"Verifying {len(saved_set)} saved streamers with multi-threading...")
+    print(f"Tracking {len(saved_set)} streamers using high-speed stream reading...")
 
-    # 3. Multi-threaded direct check (20 workers)
+    # 3. Fast Parallel Execution (30 Workers with connection reuse)
     status_payload = []
     found_online = set()
 
-    with ThreadPoolExecutor(max_workers=20) as executor:
-        results = executor.map(direct_check_streamer, saved_set)
+    start_time = time.time()
+    with ThreadPoolExecutor(max_workers=30) as executor:
+        results = executor.map(fast_check_streamer, saved_set)
         for r in results:
             if r:
                 status_payload.append(r)
                 found_online.add(r['name'])
 
-    # 4. Offline streamers
+    elapsed = round(time.time() - start_time, 2)
+    print(f"Scan finished in {elapsed}s: Found {len(found_online)} LIVE out of {len(saved_set)} streamers.")
+
+    # 4. Handle Offline Streamers
     for name in set(saved_set) - found_online:
         status_payload.append({
             'name': name,
@@ -117,8 +151,6 @@ def main():
             'viewers': 0,
             'subject': ''
         })
-
-    print(f"Verification complete: {len(found_online)} ONLINE, {len(saved_set) - len(found_online)} OFFLINE.")
 
     # 5. Push updates + guaranteed heartbeat to database
     try:
