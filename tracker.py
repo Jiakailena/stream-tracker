@@ -45,18 +45,39 @@ def bypass_infinityfree(url):
         print(f"Bypass error: {e}")
         return False
 
-def check_streamer_status(username):
-    """Accurate live status check via embed endpoint"""
+def check_streamer_full_status(username):
+    """Extracts exact room_status, real peak viewers, and room subject directly from embed"""
     url = f"https://chaturbate.com/embed/{username}/?bgcolor=black"
     try:
-        res = session.get(url, timeout=7)
+        res = session.get(url, timeout=8)
         if res.status_code != 200:
             return None
 
         html = res.text
-        status_match = re.search(r'["\']room_status["\']\s*:\s*["\']([a-zA-Z0-9_-]+)["\']', html)
-        if status_match:
-            raw_status = status_match.group(1).lower()
+        viewers = 0
+        subject = ''
+        mapped_status = 'public'
+        dossier = None
+
+        # 1. Parse initialRoomDossier JSON string
+        m_dossier = re.search(r'initialRoomDossier\s*=\s*(["\'])(.*?)\1\s*;', html, re.DOTALL)
+        if m_dossier:
+            try:
+                raw_json = json.loads(f'"{m_dossier.group(2)}"')
+                dossier = json.loads(raw_json)
+            except Exception:
+                pass
+
+        if not dossier:
+            m_dossier2 = re.search(r'initialRoomDossier\s*=\s*(\{.*?\})\s*;', html, re.DOTALL)
+            if m_dossier2:
+                try:
+                    dossier = json.loads(m_dossier2.group(1))
+                except Exception:
+                    pass
+
+        if dossier and isinstance(dossier, dict):
+            raw_status = str(dossier.get('room_status', '')).lower()
             if raw_status in ['offline', 'disabled']:
                 return None
             elif raw_status in ['private', 'ticket_show', 'vip']:
@@ -65,47 +86,44 @@ def check_streamer_status(username):
                 mapped_status = 'others'
             else:
                 mapped_status = 'public'
+
+            viewers = int(dossier.get('num_users', 0) or 0)
+            subject = str(dossier.get('room_subject', '') or '').strip()
         else:
-            if '.m3u8' in html or '"is_live": true' in html or '"is_live":true' in html:
+            # Fallback regex targeting
+            status_match = re.search(r'(?:room_status|\\u0022room_status\\u0022|\\\"room_status\\\")\s*:\s*[\"\\]*([a-zA-Z0-9_-]+)', html)
+            if status_match:
+                raw_status = status_match.group(1).lower()
+                if raw_status in ['offline', 'disabled']:
+                    return None
+                elif raw_status in ['private', 'ticket_show', 'vip']:
+                    mapped_status = 'private'
+                elif raw_status in ['away', 'hidden', 'group_show', 'club_show']:
+                    mapped_status = 'others'
+                else:
+                    mapped_status = 'public'
+            elif '.m3u8' in html or '"is_live": true' in html or '"is_live":true' in html:
                 mapped_status = 'public'
             else:
                 return None
 
+            m_v = re.search(r'(?:num_users|\\u0022num_users\\u0022|\\\"num_users\\\")\s*:\s*(\d+)', html)
+            if m_v:
+                viewers = int(m_v.group(1))
+
+            m_s = re.search(r'(?:room_subject|\\u0022room_subject\\u0022|\\\"room_subject\\\")\s*:\s*[\"\\]*([^\"\\<\n\r]+)', html)
+            if m_s:
+                subject = m_s.group(1).strip()
+
         return {
             'name': username,
             'status': mapped_status,
-            'viewers': 0,
-            'subject': ''
+            'viewers': viewers,
+            'subject': subject
         }
     except Exception:
         pass
     return None
-
-def fetch_live_details(username):
-    """Captures real-time viewer count and room goal/subject for confirmed live streamers"""
-    url = f"https://chaturbate.com/{username}/"
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-        'Cookie': 'warning_accepted=1; ag_consent=1; consent_accepted=1'
-    }
-    viewers = 0
-    subject = ''
-    try:
-        r = session.get(url, headers=headers, timeout=6)
-        if r.status_code == 200:
-            html = r.text
-            # Match viewer count
-            m_v = re.search(r'["\']num_users["\']\s*:\s*(\d+)', html) or re.search(r'\\u0022num_users\\u0022\s*:\s*(\d+)', html)
-            if m_v:
-                viewers = int(m_v.group(1))
-
-            # Match room topic / goal
-            m_s = re.search(r'["\']room_subject["\']\s*:\s*["\']([^"\']*)["\']', html) or re.search(r'\\u0022room_subject\\u0022\s*:\s*\\u0022([^"\\]*)\\u0022', html)
-            if m_s:
-                subject = m_s.group(1).encode('utf-8').decode('unicode_escape', errors='ignore')
-    except Exception:
-        pass
-    return viewers, subject
 
 def main():
     # 1. Bypass InfinityFree Security
@@ -125,34 +143,24 @@ def main():
         return
 
     saved_set = [s['name'].lower() for s in raw_streamers]
-    print(f"Checking {len(saved_set)} streamers with multi-threading...")
+    print(f"Checking {len(saved_set)} streamers with high accuracy...")
 
-    # 3. Parallel live checks
-    live_streamers = []
+    # 3. Concurrent live checks
+    status_payload = []
     found_online = set()
 
+    start_t = time.time()
     with ThreadPoolExecutor(max_workers=25) as executor:
-        results = executor.map(check_streamer_status, saved_set)
+        results = executor.map(check_streamer_full_status, saved_set)
         for r in results:
             if r:
-                live_streamers.append(r)
+                status_payload.append(r)
                 found_online.add(r['name'])
 
-    print(f"Verified {len(live_streamers)} streamers LIVE! Fetching room subjects & viewer counts...")
+    elapsed = round(time.time() - start_t, 2)
+    print(f"Scan finished in {elapsed}s: Found {len(found_online)} LIVE out of {len(saved_set)} streamers.")
 
-    # 4. Fetch subject & viewers for confirmed LIVE streamers only
-    def enrich_streamer(item):
-        v, s = fetch_live_details(item['name'])
-        item['viewers'] = v
-        item['subject'] = s
-        return item
-
-    status_payload = []
-    if live_streamers:
-        with ThreadPoolExecutor(max_workers=10) as detail_executor:
-            status_payload = list(detail_executor.map(enrich_streamer, live_streamers))
-
-    # 5. Offline Streamers
+    # 4. Offline Streamers
     for name in set(saved_set) - found_online:
         status_payload.append({
             'name': name,
@@ -161,9 +169,7 @@ def main():
             'subject': ''
         })
 
-    print(f"Final Payload: {len(live_streamers)} LIVE, {len(saved_set) - len(live_streamers)} OFFLINE.")
-
-    # 6. Push to Database
+    # 5. Push to Database
     try:
         sync_res = session.post(ENDPOINT_URL, data={
             'action': 'sync_tracker',
