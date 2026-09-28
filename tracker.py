@@ -2,11 +2,10 @@
 """
 Live Lounge - Stream Tracker (tracker.py)
 ------------------------------------------
-- 20-Worker concurrent embed scraper (https://chaturbate.com/embed/{username}/?bgcolor=black)
-- Extracts `num_viewers`, `room_status`, and `room_subject` directly from embed JS
-- Subdomain-aware InfinityFree AES cookie firewall bypass
-- Resilient POST/JSON & HTML fallback fetching for streamers
-- Syncs tracked state & continuous session metadata back to stream.php
+- 20-Worker concurrent embed scraper (chaturbate.com/embed/{username}/?bgcolor=black)
+- Extracts live status, `num_viewers`, and `room_subject` in a single pass
+- InfinityFree slowAES firewall bypass
+- Direct sync back to stream.php (load_all -> sync_tracker)
 """
 
 import os
@@ -14,480 +13,228 @@ import re
 import sys
 import time
 import json
-import html
-import urllib.parse
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import html as html_lib
 import requests
 from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+from urllib3.util import Retry
+from concurrent.futures import ThreadPoolExecutor
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.backends import default_backend
 
-# Optional crypto libraries for InfinityFree AES cookie challenge
-try:
-    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-    from cryptography.hazmat.backends import default_backend
-    CRYPTO_BACKEND = 'cryptography'
-except ImportError:
-    try:
-        from Crypto.Cipher import AES
-        CRYPTO_BACKEND = 'pycryptodome'
-    except ImportError:
-        CRYPTO_BACKEND = None
+ENDPOINT_URL = "https://stacy.infinityfreeapp.com/stream.php"
+TRACKER_SECRET = "jitul_tracker_key_2026"
 
-# ==========================================
-# CONFIGURATION
-# ==========================================
-STREAM_URL = os.getenv("STREAM_URL", "https://stacy.infinityfreeapp.com/stream.php")
-TRACKER_SECRET = os.getenv("TRACKER_SECRET", "")
-MAX_WORKERS = 20
-REQUEST_TIMEOUT = 8
-
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/124.0.0.0 Safari/537.36"
+session = requests.Session()
+adapter = HTTPAdapter(
+    pool_connections=35,
+    pool_maxsize=35,
+    max_retries=Retry(total=1, backoff_factor=0.2)
 )
+session.mount('https://', adapter)
+session.mount('http://', adapter)
 
-# ==========================================
-# INFINITYFREE AES FIREWALL BYPASS SESSION
-# ==========================================
-class InfinityFreeSession(requests.Session):
-    """
-    Automated requests.Session that intercepts InfinityFree's slowAES __test cookie
-    firewall and computes the AES-CBC response to authenticate headless calls.
-    """
-    def __init__(self):
-        super().__init__()
-        retry_strategy = Retry(
-            total=3,
-            backoff_factor=1,
-            status_forcelist=[500, 502, 503, 504]
-        )
-        adapter = HTTPAdapter(max_retries=retry_strategy, pool_connections=MAX_WORKERS + 5, pool_maxsize=MAX_WORKERS + 5)
-        self.mount("https://", adapter)
-        self.mount("http://", adapter)
-        self.headers.update({
-            "User-Agent": USER_AGENT,
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,application/json,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
-        })
-
-    def _solve_aes(self, a_hex: str, b_hex: str, c_hex: str) -> str:
-        key = bytes.fromhex(a_hex)
-        iv = bytes.fromhex(b_hex)
-        ciphertext = bytes.fromhex(c_hex)
-
-        if CRYPTO_BACKEND == 'cryptography':
-            cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())
-            decryptor = cipher.decryptor()
-            plaintext = decryptor.update(ciphertext) + decryptor.finalize()
-            return plaintext.hex()
-        elif CRYPTO_BACKEND == 'pycryptodome':
-            cipher = AES.new(key, AES.MODE_CBC, iv)
-            plaintext = cipher.decrypt(ciphertext)
-            return plaintext.hex()
-        else:
-            raise RuntimeError(
-                "Neither 'cryptography' nor 'pycryptodome' is installed. "
-                "Install via 'pip install cryptography' to bypass InfinityFree AES."
-            )
-
-    def request(self, method, url, *args, **kwargs):
-        for attempt in range(3):
-            resp = super().request(method, url, *args, **kwargs)
-
-            # Check if InfinityFree served the JavaScript test challenge page
-            if resp.status_code == 200 and ("slowAES.decrypt" in resp.text or "toNumbers" in resp.text):
-                print(f"[INFO] InfinityFree AES challenge detected (pass {attempt + 1}). Solving __test cookie...")
-                a_match = re.search(r'a=toNumbers\("([a-f0-9]+)"\)', resp.text)
-                b_match = re.search(r'b=toNumbers\("([a-f0-9]+)"\)', resp.text)
-                c_match = re.search(r'c=toNumbers\("([a-f0-9]+)"\)', resp.text)
-
-                if a_match and b_match and c_match:
-                    cookie_val = self._solve_aes(a_match.group(1), b_match.group(1), c_match.group(1))
-                    parsed = urllib.parse.urlparse(url)
-                    host = parsed.hostname or "stacy.infinityfreeapp.com"
-
-                    self.cookies.set("__test", cookie_val, domain=host, path="/")
-                    self.cookies.set("__test", cookie_val, domain=f".{host}", path="/")
-                    parts = host.split(".")
-                    if len(parts) >= 2:
-                        root_domain = "." + ".".join(parts[-2:])
-                        self.cookies.set("__test", cookie_val, domain=root_domain, path="/")
-                    self.headers["Cookie"] = f"__test={cookie_val}"
-
-                    print(f"[OK] Solved __test cookie: {cookie_val[:12]}... (applied to {host})")
-                    continue
-                else:
-                    print("[WARN] Could not parse slowAES parameters from challenge page.")
-                    return resp
-
-            return resp
-
-        return resp
+session.headers.update({
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,application/json,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.9'
+})
 
 
-# ==========================================
-# STRING & REGEX EXTRACTION HELPERS
-# ==========================================
-def clean_subject_string(raw: str) -> str:
-    """Decodes unicode escapes (\\u0020, \\u2665) and HTML entities cleanly."""
+def bypass_infinityfree(url):
+    """Bypasses InfinityFree's slowAES __test cookie challenge automatically"""
+    try:
+        res = session.get(url, timeout=12)
+        if 'slowAES.decrypt' in res.text:
+            matches = re.findall(r'toNumbers\("([0-9a-fA-F]+)"\)', res.text)
+            if len(matches) >= 3:
+                a_key = bytes.fromhex(matches[0])
+                b_iv = bytes.fromhex(matches[1])
+                c_cipher = bytes.fromhex(matches[2])
+
+                cipher = Cipher(algorithms.AES(a_key), modes.CBC(b_iv), backend=default_backend())
+                decryptor = cipher.decryptor()
+                cookie_val = (decryptor.update(c_cipher) + decryptor.finalize()).hex()
+
+                # Set on both subdomain, wildcard domain, and header for 100% persistence
+                session.cookies.set('__test', cookie_val, domain='stacy.infinityfreeapp.com', path='/')
+                session.cookies.set('__test', cookie_val, domain='.infinityfreeapp.com', path='/')
+                session.headers['Cookie'] = f'__test={cookie_val}'
+                print("[OK] InfinityFree firewall bypassed successfully!")
+                return True
+        return True
+    except Exception as e:
+        print(f"[ERROR] Bypass error: {e}")
+        return False
+
+
+def clean_subject(raw: str) -> str:
+    """Decodes unicode escapes (\\u2665, \\u0020), HTML entities, and formatting."""
     if not raw:
         return ""
     try:
-        decoded = re.sub(r'\\u([0-9a-fA-F]{4})', lambda m: chr(int(m.group(1), 16)), raw)
+        raw = re.sub(r'\\u([0-9a-fA-F]{4})', lambda m: chr(int(m.group(1), 16)), raw)
     except Exception:
-        decoded = raw
+        pass
+    raw = html_lib.unescape(raw)
+    raw = raw.replace('\\"', '"').replace('\\/', '/')
+    return re.sub(r'\s+', ' ', raw).strip()
 
-    decoded = html.unescape(decoded)
-    decoded = decoded.replace(r'\"', '"').replace(r'\/', '/')
-    return re.sub(r'\s+', ' ', decoded).strip()
 
-
-def parse_embed_html(username: str, html_text: str) -> dict:
+def extract_from_embed_html(html_text: str):
     """
-    Parses the embed page HTML directly for room_status, num_viewers, and room_subject.
-    Handles raw quotes, escaped quotes, and JS unicode escapes.
+    Extracts real-time viewer count and room subject from embed HTML.
+    Supports raw quotes, escaped quotes (\\"), and unicode escaped quotes (\\u0022).
     """
-    result = {
-        "username": username,
-        "is_live": False,
-        "status": "offline",
-        "num_viewers": 0,
-        "viewers": 0,
-        "subject": "",
-        "room_subject": ""
-    }
+    viewers = 0
+    subject = ''
 
     if not html_text:
-        return result
+        return viewers, subject
 
-    # 1. Room Status
-    status_patterns = [
-        r'(?:\\u0022|\\"|")room_status(?:\\u0022|\\"|")\s*:\s*(?:\\u0022|\\"|")([a-zA-Z0-9_\-]+)(?:\\u0022|\\"|")',
-        r'(?:\\u0022|\\"|")status(?:\\u0022|\\"|")\s*:\s*(?:\\u0022|\\"|")([a-zA-Z0-9_\-]+)(?:\\u0022|\\"|")',
-        r'initialRoomStatus\s*=\s*(?:\\u0022|\\"|")([a-zA-Z0-9_\-]+)(?:\\u0022|\\"|")',
-    ]
-    raw_status = None
-    for pattern in status_patterns:
-        m = re.search(pattern, html_text)
-        if m:
-            raw_status = m.group(1).lower().strip()
-            break
+    # 1. Real-time Viewers (Chaturbate uses num_viewers inside embed JS)
+    mv = re.search(r'(?:\\u0022|\\"|")num_viewers(?:\\u0022|\\"|")\s*:\s*(\d+)', html_text) or \
+         re.search(r'(?:\\u0022|\\"|")viewers(?:\\u0022|\\"|")\s*:\s*(\d+)', html_text) or \
+         re.search(r'(?:\\u0022|\\"|")num_users(?:\\u0022|\\"|")\s*:\s*(\d+)', html_text)
+    if mv:
+        viewers = int(mv.group(1))
 
-    # 2. Real-Time Viewer Count
-    viewer_patterns = [
-        r'(?:\\u0022|\\"|")num_viewers(?:\\u0022|\\"|")\s*:\s*(\d+)',
-        r'(?:\\u0022|\\"|")viewers(?:\\u0022|\\"|")\s*:\s*(\d+)',
-        r'(?:\\u0022|\\"|")num_users(?:\\u0022|\\"|")\s*:\s*(\d+)',
-    ]
-    viewers = 0
-    for pattern in viewer_patterns:
-        m = re.search(pattern, html_text)
-        if m:
-            viewers = int(m.group(1))
-            break
+    # 2. Room Subject / Goal
+    ms = re.search(r'(?:\\u0022|\\"|")room_subject(?:\\u0022|\\"|")\s*:\s*(?:\\u0022|\\"|")(.*?)(?:\\u0022|\\"|")(?=\s*[,}\]])', html_text, re.DOTALL) or \
+         re.search(r'(?:\\u0022|\\"|")subject(?:\\u0022|\\"|")\s*:\s*(?:\\u0022|\\"|")(.*?)(?:\\u0022|\\"|")(?=\s*[,}\]])', html_text, re.DOTALL) or \
+         re.search(r'(?:\\u0022|\\"|")room_title(?:\\u0022|\\"|")\s*:\s*(?:\\u0022|\\"|")(.*?)(?:\\u0022|\\"|")(?=\s*[,}\]])', html_text, re.DOTALL)
+    if ms:
+        subject = clean_subject(ms.group(1))
 
-    # 3. Room Subject / Goal
-    subject_patterns = [
-        r'\\u0022(?:room_subject|subject|room_title|topic)\\u0022\s*:\s*\\u0022(.*?)\\u0022(?=\s*[,}\]])',
-        r'\\"(?:room_subject|subject|room_title|topic)\\"\s*:\s*\\"(.*?)\\"(?=\s*[,}\]])',
-        r'"(?:room_subject|subject|room_title|topic)"\s*:\s*"(.*?)"(?=\s*[,}\]])',
-    ]
-    extracted_subject = ""
-    for pattern in subject_patterns:
-        m = re.search(pattern, html_text, re.DOTALL)
-        if m:
-            extracted_subject = clean_subject_string(m.group(1))
-            break
-
-    # Fallback to <title> if JS subject is missing
-    if not extracted_subject:
+    # Fallback to <title> if JS subject tag is not found
+    if not subject:
         title_match = re.search(r'<title>(.*?)</title>', html_text, re.IGNORECASE | re.DOTALL)
         if title_match:
             t = title_match.group(1).strip()
             t = re.sub(r'\s*-\s*Chaturbate.*$', '', t, flags=re.IGNORECASE)
-            if t and t.lower() != username.lower():
-                extracted_subject = clean_subject_string(t)
+            subject = clean_subject(t)
 
-    # 4. Map Normalized Status Hierarchy
-    if raw_status:
-        if raw_status == "public":
-            result["status"] = "public"
-            result["is_live"] = True
-        elif raw_status in ("private", "vip", "c2c"):
-            result["status"] = "private"
-            result["is_live"] = True
-        elif raw_status in ("offline", "away_offline"):
-            result["status"] = "offline"
-            result["is_live"] = False
-        else:
-            result["status"] = "others"
-            result["is_live"] = True
-    else:
-        if "room is offline" in html_text.lower() or "room_is_offline" in html_text.lower():
-            result["status"] = "offline"
-            result["is_live"] = False
-        elif viewers > 0:
-            result["status"] = "public"
-            result["is_live"] = True
-
-    if result["is_live"]:
-        result["num_viewers"] = viewers
-        result["viewers"] = viewers
-        result["subject"] = extracted_subject
-        result["room_subject"] = extracted_subject
-    else:
-        result["num_viewers"] = 0
-        result["viewers"] = 0
-        result["subject"] = ""
-        result["room_subject"] = ""
-
-    return result
+    return viewers, subject
 
 
-def extract_streamers_from_json(data) -> list:
-    """Parses various list/dict formats into a clean list of usernames."""
-    streamers = []
-    if isinstance(data, list):
-        for item in data:
-            if isinstance(item, str):
-                streamers.append(item.strip().lower())
-            elif isinstance(item, dict):
-                u = item.get("username") or item.get("name") or item.get("streamer")
-                if u:
-                    streamers.append(str(u).strip().lower())
-    elif isinstance(data, dict):
-        for key in ("streamers", "data", "results", "models", "users"):
-            if key in data and isinstance(data[key], list):
-                for item in data[key]:
-                    if isinstance(item, str):
-                        streamers.append(item.strip().lower())
-                    elif isinstance(item, dict):
-                        u = item.get("username") or item.get("name") or item.get("streamer")
-                        if u:
-                            streamers.append(str(u).strip().lower())
-    return sorted(list(set(s for s in streamers if s)))
-
-
-def extract_streamers_from_html(html_text: str) -> list:
-    """Fallback extractor that extracts streamer names from HTML tags, data attributes, and embedded JS."""
-    streamers = set()
-    if not html_text:
-        return []
-
-    # 1. JSON objects embedded in scripts: "username": "xxx"
-    json_matches = re.findall(r'["\'](?:username|streamer)["\']\s*:\s*["\']([a-zA-Z0-9_\-]+)["\']', html_text, re.IGNORECASE)
-    for u in json_matches:
-        u_clean = u.strip().lower()
-        if u_clean not in ("username", "streamer", "status", "public", "private", "offline", "others", "null", "true", "false", "undefined"):
-            streamers.add(u_clean)
-
-    # 2. Data attributes: data-username="xxx", data-streamer="xxx"
-    attr_matches = re.findall(r'data-(?:username|streamer|model|name)=["\']([a-zA-Z0-9_\-]+)["\']', html_text, re.IGNORECASE)
-    for u in attr_matches:
-        streamers.add(u.strip().lower())
-
-    # 3. Chaturbate embed URLs
-    embed_matches = re.findall(r'chaturbate\.com/embed/([a-zA-Z0-9_\-]+)', html_text, re.IGNORECASE)
-    for u in embed_matches:
-        streamers.add(u.strip().lower())
-
-    # 4. JS Array definitions: streamers = ["xxx", "yyy"]
-    array_matches = re.findall(r'(?:streamers|models|users|streamer_list)\s*=\s*\[(.*?)\]', html_text, re.IGNORECASE | re.DOTALL)
-    for arr in array_matches:
-        for item in re.findall(r'["\']([a-zA-Z0-9_\-]+)["\']', arr):
-            u_clean = item.strip().lower()
-            if len(u_clean) > 2 and u_clean not in ("public", "private", "offline", "others"):
-                streamers.add(u_clean)
-
-    return sorted(list(streamers))
-
-
-# ==========================================
-# SCRAPING ENGINE (20 WORKERS)
-# ==========================================
-def check_streamer_embed(session: requests.Session, username: str) -> dict:
-    """Queries the embed page and returns parsed status."""
+def check_live_status_embed(username: str):
+    """
+    Fast, reliable 20-worker live status detector via embed URL.
+    Extracts status, viewers, and subject in a single request.
+    """
     url = f"https://chaturbate.com/embed/{username}/?bgcolor=black"
     try:
-        resp = session.get(url, timeout=REQUEST_TIMEOUT)
-        if resp.status_code == 200:
-            return parse_embed_html(username, resp.text)
-        return {
-            "username": username,
-            "is_live": False,
-            "status": "offline",
-            "num_viewers": 0,
-            "viewers": 0,
-            "subject": "",
-            "room_subject": ""
-        }
-    except Exception as e:
-        return {
-            "username": username,
-            "is_live": False,
-            "status": "offline",
-            "num_viewers": 0,
-            "viewers": 0,
-            "subject": "",
-            "room_subject": "",
-            "error": str(e)
-        }
+        res = session.get(url, timeout=7)
+        if res.status_code == 200:
+            html_text = res.text
+
+            # Check Room Status (Matches \u0022room_status\u0022: \u0022public\u0022)
+            status_match = re.search(
+                r'(?:\\u0022|\\"|")room_status(?:\\u0022|\\"|")\s*:\s*(?:\\u0022|\\"|")([a-zA-Z0-9_\-]+)(?:\\u0022|\\"|")',
+                html_text
+            )
+
+            status = None
+            if status_match:
+                raw_status = status_match.group(1).lower()
+                if raw_status in ['offline', 'disabled', 'away_offline']:
+                    return None
+                elif raw_status in ['private', 'ticket_show', 'vip', 'c2c']:
+                    status = 'private'
+                elif raw_status in ['away', 'hidden', 'group_show', 'club_show']:
+                    status = 'others'
+                else:
+                    status = 'public'
+            elif '.m3u8' in html_text or '"is_live": true' in html_text or '\\u0022is_live\\u0022: true' in html_text:
+                status = 'public'
+            else:
+                return None
+
+            # Extract Viewers & Subject directly from the same HTML
+            viewers, subject = extract_from_embed_html(html_text)
+
+            return {
+                'name': username,
+                'status': status,
+                'viewers': viewers,
+                'subject': subject
+            }
+    except Exception:
+        pass
+
+    return None
 
 
-def get_streamers_list(session: InfinityFreeSession) -> list:
-    """Fetches tracked usernames from stream.php via POST/GET JSON or HTML parsing fallback."""
-    print(f"[INFO] Fetching streamer list from {STREAM_URL}...")
-    last_html = ""
-
-    # Step 1: POST with JSON (Primary method for stream.php API routers)
-    for act in ["get_streamers", "streamers", "get_all"]:
-        payload = {"action": act}
-        if TRACKER_SECRET:
-            payload["secret"] = TRACKER_SECRET
-        try:
-            resp = session.post(STREAM_URL, json=payload, timeout=12)
-            if resp.status_code == 200:
-                try:
-                    data = resp.json()
-                    streamers = extract_streamers_from_json(data)
-                    if streamers:
-                        print(f"[OK] Retrieved {len(streamers)} streamers via POST JSON (action='{act}').")
-                        return streamers
-                except Exception:
-                    last_html = resp.text
-        except Exception as e:
-            print(f"[DEBUG] POST json action='{act}' failed: {e}")
-
-    # Step 2: POST with Form URL Encoded
-    try:
-        payload = {"action": "get_streamers"}
-        if TRACKER_SECRET:
-            payload["secret"] = TRACKER_SECRET
-        resp = session.post(STREAM_URL, data=payload, timeout=12)
-        if resp.status_code == 200:
-            try:
-                data = resp.json()
-                streamers = extract_streamers_from_json(data)
-                if streamers:
-                    print(f"[OK] Retrieved {len(streamers)} streamers via POST form-data.")
-                    return streamers
-            except Exception:
-                last_html = resp.text
-    except Exception as e:
-        print(f"[DEBUG] POST form-data failed: {e}")
-
-    # Step 3: GET with query params
-    try:
-        params = {"action": "get_streamers"}
-        if TRACKER_SECRET:
-            params["secret"] = TRACKER_SECRET
-        resp = session.get(STREAM_URL, params=params, timeout=12)
-        if resp.status_code == 200:
-            try:
-                data = resp.json()
-                streamers = extract_streamers_from_json(data)
-                if streamers:
-                    print(f"[OK] Retrieved {len(streamers)} streamers via GET JSON.")
-                    return streamers
-            except Exception:
-                last_html = resp.text
-    except Exception as e:
-        print(f"[DEBUG] GET request failed: {e}")
-
-    # Step 4: Fallback to extracting from the served HTML dashboard
-    if last_html:
-        streamers = extract_streamers_from_html(last_html)
-        if streamers:
-            print(f"[OK] Extracted {len(streamers)} streamers directly from stream.php HTML dashboard!")
-            return streamers
-        else:
-            print("[WARN] Received HTML response from backend but found no streamer signatures.")
-            print(f"[DEBUG] HTML snippet: {last_html[:250]}")
-
-    return []
-
-
-def sync_results_to_backend(session: InfinityFreeSession, results: list) -> dict:
-    """Posts tracked updates back to stream.php to maintain continuous sessions."""
-    payload = {
-        "action": "sync_tracking",
-        "timestamp": int(time.time()),
-        "streamers": results,
-        "data": results
-    }
-    if TRACKER_SECRET:
-        payload["secret"] = TRACKER_SECRET
-
-    print(f"[INFO] Syncing {len(results)} streamers back to database...")
-    try:
-        resp = session.post(STREAM_URL, json=payload, timeout=15)
-        try:
-            return resp.json()
-        except Exception:
-            return {"status_code": resp.status_code, "text": resp.text[:200]}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-
-# ==========================================
-# MAIN EXECUTION ROUTINE
-# ==========================================
 def main():
-    start_time = time.time()
     print("=" * 65)
     print(" LIVE LOUNGE TRACKER - DIRECT EMBED PARSER")
     print("=" * 65)
 
-    backend_session = InfinityFreeSession()
-    streamers = get_streamers_list(backend_session)
+    # 1. InfinityFree Firewall Bypass
+    bypass_infinityfree(ENDPOINT_URL)
 
-    if not streamers:
-        print("[WARN] No streamers returned from backend. Exiting.")
-        sys.exit(0)
+    # 2. Load streamers from database
+    try:
+        res = session.post(ENDPOINT_URL, data={'action': 'load_all'}, timeout=15)
+        site_data = res.json()
+        raw_streamers = site_data.get('streamers', [])
+    except Exception as e:
+        print(f"[ERROR] Failed to load streamers: {e}")
+        return
 
-    print(f"[INFO] Loaded {len(streamers)} streamers. Starting 20-worker pool...")
+    if not raw_streamers:
+        print("[WARN] No saved streamers found in library.")
+        return
 
-    embed_session = requests.Session()
-    embed_adapter = HTTPAdapter(
-        pool_connections=MAX_WORKERS + 5,
-        pool_maxsize=MAX_WORKERS + 5,
-        max_retries=2
-    )
-    embed_session.mount("https://", embed_adapter)
-    embed_session.headers.update({"User-Agent": USER_AGENT})
+    saved_set = [s['name'].lower() for s in raw_streamers if 'name' in s]
+    print(f"[INFO] Total streamers in library: {len(saved_set)}")
 
-    results = []
-    live_count = 0
+    # 3. High-Speed 20-Workers Concurrency Live Verification & Detail Extraction
+    print(f"[INFO] Verifying live status, viewers, and subjects with 20 parallel workers...")
+    confirmed_live = []
+    found_online = set()
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        future_to_username = {
-            executor.submit(check_streamer_embed, embed_session, user): user
-            for user in streamers
-        }
+    with ThreadPoolExecutor(max_workers=20) as executor:
+        results = executor.map(check_live_status_embed, saved_set)
+        for r in results:
+            if r:
+                confirmed_live.append(r)
+                found_online.add(r['name'])
 
-        for future in as_completed(future_to_username):
-            data = future.result()
-            results.append(data)
-            if data.get("is_live"):
-                live_count += 1
-                subj = data.get("subject", "")
-                preview = (subj[:45] + "...") if len(subj) > 45 else subj
-                print(
-                    f"  [LIVE] {data['username']:<18} | "
-                    f"Status: {data['status']:<7} | "
-                    f"Viewers: {data['num_viewers']:<5} | "
-                    f"Goal: {preview}"
-                )
+    print(f"[OK] Detected {len(confirmed_live)} streamers LIVE!")
 
-    elapsed = round(time.time() - start_time, 2)
-    print("-" * 65)
-    print(f"[DONE] Scraped {len(results)} models in {elapsed}s. Detected {live_count} streamers LIVE!")
+    # 4. Handle Offline streamers
+    status_payload = list(confirmed_live)
+    for name in set(saved_set) - found_online:
+        status_payload.append({
+            'name': name,
+            'status': 'offline',
+            'viewers': 0,
+            'subject': ''
+        })
 
-    sync_resp = sync_results_to_backend(backend_session, results)
-    print(f"[SYNC] Server Response: {sync_resp}")
+    # Summary Report in Actions Log
+    print("\n--- FINAL LIVE STATUS REPORT ---")
+    for item in status_payload:
+        if item['status'] != 'offline':
+            subj = item['subject']
+            preview = (subj[:45] + "...") if len(subj) > 45 else subj
+            print(f"-> [{item['name'].upper():<16}] Status: {item['status']:<7} | Viewers: {item['viewers']:<5} | Subject: '{preview}'")
+    print(f"\nSummary: {len(confirmed_live)} LIVE, {len(saved_set) - len(confirmed_live)} OFFLINE.\n")
+
+    # 5. Push to Database
+    print("[INFO] Syncing verified stats to database...")
+    try:
+        sync_res = session.post(ENDPOINT_URL, data={
+            'action': 'sync_tracker',
+            'secret': TRACKER_SECRET,
+            'payload': json.dumps(status_payload)
+        }, timeout=20)
+        print("[SYNC] Database Sync Result:", sync_res.json())
+    except Exception as e:
+        print(f"[ERROR] Sync error: {e}")
+
     print("=" * 65)
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
