@@ -5,6 +5,7 @@ Live Lounge - Stream Tracker (tracker.py)
 - 20-Worker concurrent embed scraper (https://chaturbate.com/embed/{username}/?bgcolor=black)
 - Extracts `num_viewers`, `room_status`, and `room_subject` directly from embed JS
 - Subdomain-aware InfinityFree AES cookie firewall bypass
+- Resilient POST/JSON & HTML fallback fetching for streamers
 - Syncs tracked state & continuous session metadata back to stream.php
 """
 
@@ -91,7 +92,6 @@ class InfinityFreeSession(requests.Session):
             )
 
     def request(self, method, url, *args, **kwargs):
-        # Allow up to 3 challenge-response iterations
         for attempt in range(3):
             resp = super().request(method, url, *args, **kwargs)
 
@@ -107,16 +107,12 @@ class InfinityFreeSession(requests.Session):
                     parsed = urllib.parse.urlparse(url)
                     host = parsed.hostname or "stacy.infinityfreeapp.com"
 
-                    # 1. Bind to exact subdomain
                     self.cookies.set("__test", cookie_val, domain=host, path="/")
-                    # 2. Bind with leading dot for subdomain matching
                     self.cookies.set("__test", cookie_val, domain=f".{host}", path="/")
-                    # 3. Bind to root domain
                     parts = host.split(".")
                     if len(parts) >= 2:
                         root_domain = "." + ".".join(parts[-2:])
                         self.cookies.set("__test", cookie_val, domain=root_domain, path="/")
-                    # 4. Inject directly into headers to guarantee transmission
                     self.headers["Cookie"] = f"__test={cookie_val}"
 
                     print(f"[OK] Solved __test cookie: {cookie_val[:12]}... (applied to {host})")
@@ -249,6 +245,64 @@ def parse_embed_html(username: str, html_text: str) -> dict:
     return result
 
 
+def extract_streamers_from_json(data) -> list:
+    """Parses various list/dict formats into a clean list of usernames."""
+    streamers = []
+    if isinstance(data, list):
+        for item in data:
+            if isinstance(item, str):
+                streamers.append(item.strip().lower())
+            elif isinstance(item, dict):
+                u = item.get("username") or item.get("name") or item.get("streamer")
+                if u:
+                    streamers.append(str(u).strip().lower())
+    elif isinstance(data, dict):
+        for key in ("streamers", "data", "results", "models", "users"):
+            if key in data and isinstance(data[key], list):
+                for item in data[key]:
+                    if isinstance(item, str):
+                        streamers.append(item.strip().lower())
+                    elif isinstance(item, dict):
+                        u = item.get("username") or item.get("name") or item.get("streamer")
+                        if u:
+                            streamers.append(str(u).strip().lower())
+    return sorted(list(set(s for s in streamers if s)))
+
+
+def extract_streamers_from_html(html_text: str) -> list:
+    """Fallback extractor that extracts streamer names from HTML tags, data attributes, and embedded JS."""
+    streamers = set()
+    if not html_text:
+        return []
+
+    # 1. JSON objects embedded in scripts: "username": "xxx"
+    json_matches = re.findall(r'["\'](?:username|streamer)["\']\s*:\s*["\']([a-zA-Z0-9_\-]+)["\']', html_text, re.IGNORECASE)
+    for u in json_matches:
+        u_clean = u.strip().lower()
+        if u_clean not in ("username", "streamer", "status", "public", "private", "offline", "others", "null", "true", "false", "undefined"):
+            streamers.add(u_clean)
+
+    # 2. Data attributes: data-username="xxx", data-streamer="xxx"
+    attr_matches = re.findall(r'data-(?:username|streamer|model|name)=["\']([a-zA-Z0-9_\-]+)["\']', html_text, re.IGNORECASE)
+    for u in attr_matches:
+        streamers.add(u.strip().lower())
+
+    # 3. Chaturbate embed URLs
+    embed_matches = re.findall(r'chaturbate\.com/embed/([a-zA-Z0-9_\-]+)', html_text, re.IGNORECASE)
+    for u in embed_matches:
+        streamers.add(u.strip().lower())
+
+    # 4. JS Array definitions: streamers = ["xxx", "yyy"]
+    array_matches = re.findall(r'(?:streamers|models|users|streamer_list)\s*=\s*\[(.*?)\]', html_text, re.IGNORECASE | re.DOTALL)
+    for arr in array_matches:
+        for item in re.findall(r'["\']([a-zA-Z0-9_\-]+)["\']', arr):
+            u_clean = item.strip().lower()
+            if len(u_clean) > 2 and u_clean not in ("public", "private", "offline", "others"):
+                streamers.add(u_clean)
+
+    return sorted(list(streamers))
+
+
 # ==========================================
 # SCRAPING ENGINE (20 WORKERS)
 # ==========================================
@@ -282,41 +336,74 @@ def check_streamer_embed(session: requests.Session, username: str) -> dict:
 
 
 def get_streamers_list(session: InfinityFreeSession) -> list:
-    """Fetches tracked usernames from stream.php."""
-    params = {"action": "get_streamers"}
-    if TRACKER_SECRET:
-        params["secret"] = TRACKER_SECRET
-
+    """Fetches tracked usernames from stream.php via POST/GET JSON or HTML parsing fallback."""
     print(f"[INFO] Fetching streamer list from {STREAM_URL}...")
+    last_html = ""
+
+    # Step 1: POST with JSON (Primary method for stream.php API routers)
+    for act in ["get_streamers", "streamers", "get_all"]:
+        payload = {"action": act}
+        if TRACKER_SECRET:
+            payload["secret"] = TRACKER_SECRET
+        try:
+            resp = session.post(STREAM_URL, json=payload, timeout=12)
+            if resp.status_code == 200:
+                try:
+                    data = resp.json()
+                    streamers = extract_streamers_from_json(data)
+                    if streamers:
+                        print(f"[OK] Retrieved {len(streamers)} streamers via POST JSON (action='{act}').")
+                        return streamers
+                except Exception:
+                    last_html = resp.text
+        except Exception as e:
+            print(f"[DEBUG] POST json action='{act}' failed: {e}")
+
+    # Step 2: POST with Form URL Encoded
     try:
+        payload = {"action": "get_streamers"}
+        if TRACKER_SECRET:
+            payload["secret"] = TRACKER_SECRET
+        resp = session.post(STREAM_URL, data=payload, timeout=12)
+        if resp.status_code == 200:
+            try:
+                data = resp.json()
+                streamers = extract_streamers_from_json(data)
+                if streamers:
+                    print(f"[OK] Retrieved {len(streamers)} streamers via POST form-data.")
+                    return streamers
+            except Exception:
+                last_html = resp.text
+    except Exception as e:
+        print(f"[DEBUG] POST form-data failed: {e}")
+
+    # Step 3: GET with query params
+    try:
+        params = {"action": "get_streamers"}
+        if TRACKER_SECRET:
+            params["secret"] = TRACKER_SECRET
         resp = session.get(STREAM_URL, params=params, timeout=12)
         if resp.status_code == 200:
             try:
                 data = resp.json()
-            except json.JSONDecodeError:
-                print(f"[ERROR] Response is not JSON. Status: {resp.status_code}")
-                print(f"[DEBUG] Raw response: {resp.text[:300]}")
-                return []
-
-            streamers = []
-            if isinstance(data, list):
-                for item in data:
-                    if isinstance(item, str):
-                        streamers.append(item.strip().lower())
-                    elif isinstance(item, dict):
-                        u = item.get("username") or item.get("name")
-                        if u:
-                            streamers.append(str(u).strip().lower())
-            elif isinstance(data, dict):
-                for key in ("streamers", "data", "results"):
-                    if key in data and isinstance(data[key], list):
-                        return [
-                            (x.get("username") if isinstance(x, dict) else str(x)).strip().lower()
-                            for x in data[key]
-                        ]
-            return sorted(list(set(streamers)))
+                streamers = extract_streamers_from_json(data)
+                if streamers:
+                    print(f"[OK] Retrieved {len(streamers)} streamers via GET JSON.")
+                    return streamers
+            except Exception:
+                last_html = resp.text
     except Exception as e:
-        print(f"[ERROR] Failed to fetch streamer list: {e}")
+        print(f"[DEBUG] GET request failed: {e}")
+
+    # Step 4: Fallback to extracting from the served HTML dashboard
+    if last_html:
+        streamers = extract_streamers_from_html(last_html)
+        if streamers:
+            print(f"[OK] Extracted {len(streamers)} streamers directly from stream.php HTML dashboard!")
+            return streamers
+        else:
+            print("[WARN] Received HTML response from backend but found no streamer signatures.")
+            print(f"[DEBUG] HTML snippet: {last_html[:250]}")
 
     return []
 
