@@ -3,6 +3,7 @@ import re
 import sys
 import time
 import requests
+from concurrent.futures import ThreadPoolExecutor
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.backends import default_backend
 
@@ -37,39 +38,45 @@ def bypass_infinityfree(url):
         print(f"Bypass error: {e}")
         return False
 
-def fetch_all_chaturbate_live_rooms():
-    """Paced pagination through Chaturbate's API with 0.5s delay to prevent 429 rate limit"""
-    all_rooms = []
-    limit = 500
-    offset = 0
-    max_pages = 25  # Covers up to 12,500 models
+def direct_check_streamer(username):
+    """Direct high-speed room verification via public embed endpoint"""
+    url = f"https://chaturbate.com/embed/{username}/?bgcolor=black"
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept-Language': 'en-US,en;q=0.9'
+    }
+    try:
+        res = requests.get(url, headers=headers, timeout=8)
+        if res.status_code == 200:
+            html = res.text
+            is_live = False
+            if '"is_live": true' in html or '"is_live":true' in html or '.m3u8' in html:
+                is_live = True
+            elif 'room_status' in html and '"room_status": "offline"' not in html and '"room_status":"offline"' not in html:
+                if '"room_status": "public"' in html or '"room_status":"public"' in html:
+                    is_live = True
 
-    print("Fetching global live rooms via paced pagination...")
-    for page in range(max_pages):
-        url = f"https://chaturbate.com/api/public/affiliates/onlinerooms/?wm=9w8Zb&client_ip=request_ip&format=json&limit={limit}&offset={offset}"
-        try:
-            r = session.get(url, timeout=20)
-            if r.status_code == 200:
-                data = r.json()
-                results = data.get('results', []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
-                if not results:
-                    break
-                all_rooms.extend(results)
-                print(f"Page {page+1}: fetched {len(results)} rooms (Total so far: {len(all_rooms)})")
-                if len(results) < limit:
-                    break
-            else:
-                print(f"Notice on page {page+1}: status code {r.status_code}")
-                break
-        except Exception as e:
-            print(f"Error on page {page+1}: {e}")
-            break
+            if is_live:
+                status = 'public'
+                if '"room_status": "private"' in html or '"room_status":"private"' in html or 'ticket_show' in html:
+                    status = 'private'
+                elif '"room_status": "away"' in html or '"room_status": "hidden"' in html or 'hidden' in html or 'group_show' in html:
+                    status = 'others'
 
-        offset += limit
-        time.sleep(0.5)  # 0.5s gentle gap to eliminate rate limit completely
+                viewers = 0
+                m_view = re.search(r'"num_users":\s*(\d+)', html)
+                if m_view:
+                    viewers = int(m_view.group(1))
 
-    print(f"Global scanning complete. Total online rooms: {len(all_rooms)}")
-    return all_rooms
+                return {
+                    'name': username,
+                    'status': status,
+                    'viewers': viewers,
+                    'subject': ''
+                }
+    except Exception:
+        pass
+    return None
 
 def main():
     # 1. Bypass InfinityFree Security
@@ -88,63 +95,32 @@ def main():
         print("No saved streamers found in library.")
         return
 
-    # Map current states in DB
-    saved_streamers_map = {s['name'].lower(): int(s.get('is_online', 0)) for s in raw_streamers}
-    saved_set = set(saved_streamers_map.keys())
-    print(f"Total streamers in library: {len(saved_set)}")
+    saved_set = [s['name'].lower() for s in raw_streamers]
+    print(f"Verifying {len(saved_set)} saved streamers with multi-threading...")
 
-    # 3. Fetch all active live rooms globally with paced delay
-    live_rooms = fetch_all_chaturbate_live_rooms()
-
-    # 4. Instant O(1) matching & status mapping
-    current_live_matches = {}
-    for room in live_rooms:
-        if not isinstance(room, dict):
-            continue
-        u_name = room.get('username', '').lower()
-        if u_name in saved_set:
-            current_show = room.get('current_show', 'public').lower()
-            viewers = room.get('num_users', 0)
-            subject = room.get('room_subject', '')
-
-            # Exact status mapping:
-            # - public -> public
-            # - private / ticket_show -> private
-            # - away / hidden / group_show / club_show -> others
-            mapped_status = 'public'
-            if current_show in ['private', 'ticket_show']:
-                mapped_status = 'private'
-            elif current_show in ['away', 'hidden', 'group_show', 'club_show'] or 'hidden' in current_show:
-                mapped_status = 'others'
-
-            current_live_matches[u_name] = {
-                'name': u_name,
-                'status': mapped_status,
-                'viewers': viewers,
-                'subject': subject
-            }
-
-    # 5. Build payload (Online streamers + recently went offline delta)
+    # 3. Multi-threaded direct check (20 workers)
     status_payload = []
+    found_online = set()
 
-    # All currently live streamers
-    for u_name, data in current_live_matches.items():
-        status_payload.append(data)
+    with ThreadPoolExecutor(max_workers=20) as executor:
+        results = executor.map(direct_check_streamer, saved_set)
+        for r in results:
+            if r:
+                status_payload.append(r)
+                found_online.add(r['name'])
 
-    # Streamers that were online in DB, but just went offline
-    for u_name, prev_online in saved_streamers_map.items():
-        if prev_online == 1 and u_name not in current_live_matches:
-            status_payload.append({
-                'name': u_name,
-                'status': 'offline',
-                'viewers': 0,
-                'subject': ''
-            })
+    # 4. Offline streamers
+    for name in set(saved_set) - found_online:
+        status_payload.append({
+            'name': name,
+            'status': 'offline',
+            'viewers': 0,
+            'subject': ''
+        })
 
-    print(f"Found {len(current_live_matches)} ONLINE out of {len(saved_set)} streamers.")
-    print(f"Sending {len(status_payload)} updates to database...")
+    print(f"Verification complete: {len(found_online)} ONLINE, {len(saved_set) - len(found_online)} OFFLINE.")
 
-    # 6. Push updates + guaranteed heartbeat
+    # 5. Push updates + guaranteed heartbeat to database
     try:
         sync_res = session.post(ENDPOINT_URL, data={
             'action': 'sync_tracker',
@@ -157,4 +133,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-    
