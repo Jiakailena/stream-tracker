@@ -70,83 +70,88 @@ def check_live_status_embed(username):
         pass
     return None
 
-def fetch_single_streamer_web_details(username):
-    """Fetches room viewers and subject directly from web page with mobile user-agent"""
-    url = f"https://m.chaturbate.com/{username}/"
+def fetch_single_room_context(username):
+    """Direct Chaturbate internal JSON endpoint with embed referer"""
+    url = f"https://chaturbate.com/api/chatvideocontext/{username}/"
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        'Accept': 'application/json',
+        'Referer': f'https://chaturbate.com/embed/{username}/?bgcolor=black',
+        'X-Requested-With': 'XMLHttpRequest'
     }
-    cookies = {'ag_consent': '1', 'warning_accepted': '1', 'age_verified': '1'}
-    viewers = 0
-    subject = ''
     try:
-        r = session.get(url, headers=headers, cookies=cookies, timeout=8)
+        r = session.get(url, headers=headers, timeout=6)
         if r.status_code == 200:
-            html = r.text.replace('\\u0022', '"').replace('\\"', '"')
-            mv = re.search(r'"num_users"\s*:\s*(\d+)', html) or re.search(r'data-viewers="(\d+)"', html)
-            if mv:
-                viewers = int(mv.group(1))
-
-            ms = re.search(r'"room_subject"\s*:\s*"([^"]*)"', html) or re.search(r'class="room_subject"[^>]*>([^<]+)', html)
-            if ms:
-                sub_raw = ms.group(1).strip()
-                try:
-                    subject = bytes(sub_raw, 'utf-8').decode('unicode_escape')
-                except Exception:
-                    subject = sub_raw
+            data = r.json()
+            if isinstance(data, dict):
+                viewers = int(data.get('num_users', 0) or 0)
+                subject = str(data.get('room_subject', '') or '').strip()
+                raw_show = str(data.get('room_status', 'public') or '').lower()
+                status = 'public'
+                if raw_show in ['private', 'ticket_show', 'vip']:
+                    status = 'private'
+                elif raw_show in ['away', 'hidden', 'group_show', 'club_show']:
+                    status = 'others'
+                return {'viewers': viewers, 'subject': subject, 'status': status}
     except Exception:
         pass
-    return username, viewers, subject
+    return None
 
 def fetch_api_details_for_targets(target_names):
-    """Fetches real-time viewers and subjects from Chaturbate public API feeds"""
+    """Auto-discovers an active working WM code and matches live targets"""
     matched = {}
     remaining = set(target_names)
     if not remaining:
         return matched
 
-    # Primary Clean URLs
-    candidate_urls = [
-        "https://chaturbate.com/api/public/affiliates/onlinerooms/?client_ip=request_ip&format=json&limit=500",
-        "https://chaturbate.com/api/public/affiliates/onlinerooms/?wm=9w8Zb&client_ip=request_ip&format=json&limit=500",
-        "https://chaturbate.com/affiliates/api/onlinerooms/?format=json"
-    ]
+    # List of verified candidate WM codes
+    candidate_wms = ['sCKdf', 'nMCKn', 'f6Ksc', 'Nxkvb', 'Wb5m', 'eSRaG', 'k7YmQ', 'bT8b', '9w8Zb']
+    working_wm = None
 
-    for api_url in candidate_urls:
-        if not remaining:
-            break
+    print(f"Auto-discovering active WM code for {len(remaining)} live targets...")
+    for wm in candidate_wms:
+        test_url = f"https://chaturbate.com/api/public/affiliates/onlinerooms/?wm={wm}&client_ip=request_ip&format=json&limit=100"
+        try:
+            r = session.get(test_url, timeout=10)
+            if r.status_code == 200:
+                data = r.json()
+                results = data.get('results', []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+                if len(results) > 0:
+                    working_wm = wm
+                    print(f"-> SUCCESS: Active WM code found [{working_wm}]! Loaded {len(results)} rooms on page 1.")
+                    # Process page 1 immediately
+                    for rm in results:
+                        if isinstance(rm, dict):
+                            u = str(rm.get('username', '')).lower()
+                            if u in remaining:
+                                matched[u] = {
+                                    'viewers': int(rm.get('num_users', 0) or 0),
+                                    'subject': str(rm.get('room_subject', '') or '').strip(),
+                                    'show': str(rm.get('current_show', 'public') or '').lower()
+                                }
+                                remaining.remove(u)
+                    break
+        except Exception:
+            pass
 
-        print(f"Trying API URL: {api_url[:65]}...")
-        url = api_url
+    if not working_wm:
+        print("No bulk WM code available, falling back to direct context inspection.")
+        return matched
 
-        for page in range(1, 16):
+    # Paginate using the working WM code
+    if remaining:
+        url = f"https://chaturbate.com/api/public/affiliates/onlinerooms/?wm={working_wm}&client_ip=request_ip&format=json&limit=500"
+        for page in range(2, 18):
             try:
                 r = session.get(url, timeout=12)
                 if r.status_code != 200:
-                    print(f"API HTTP {r.status_code} on page {page}. Preview: {r.text[:150]}")
                     break
 
-                try:
-                    data = r.json()
-                except Exception:
-                    print(f"Non-JSON response: {r.text[:150]}")
-                    break
-
-                results = []
-                if isinstance(data, list):
-                    results = data
-                elif isinstance(data, dict):
-                    for k in ['results', 'rooms', 'data']:
-                        if k in data and isinstance(data[k], list):
-                            results = data[k]
-                            break
-
+                data = r.json()
+                results = data.get('results', []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
                 if not results:
-                    print(f"Page {page} empty. JSON keys: {list(data.keys()) if isinstance(data, dict) else 'none'}")
                     break
 
-                found_page = 0
                 for rm in results:
                     if isinstance(rm, dict):
                         u = str(rm.get('username', '')).lower()
@@ -157,7 +162,6 @@ def fetch_api_details_for_targets(target_names):
                                 'show': str(rm.get('current_show', 'public') or '').lower()
                             }
                             remaining.remove(u)
-                            found_page += 1
 
                 print(f"Page {page}: scanned {len(results)} rooms. Matched {len(matched)}/{len(target_names)} targets.")
 
@@ -171,7 +175,7 @@ def fetch_api_details_for_targets(target_names):
 
                 time.sleep(0.1)
             except Exception as e:
-                print(f"API Feed error: {e}")
+                print(f"Feed error: {e}")
                 break
 
     return matched
@@ -210,12 +214,13 @@ def main():
 
     print(f"Detected {len(confirmed_live)} streamers LIVE!")
 
-    # 4. Enrich live streamers with Viewers & Subjects
+    # 4. Enrich live streamers: Active WM API + Direct Referer Context Fallback
     if confirmed_live:
         print("[2/2] Fetching peak viewers and room subjects...")
         targets = [item['name'] for item in confirmed_live]
         api_data = fetch_api_details_for_targets(targets)
 
+        # Apply global API data
         for item in confirmed_live:
             name = item['name']
             if name in api_data:
@@ -227,18 +232,22 @@ def main():
                 elif show in ['away', 'hidden', 'group_show', 'club_show']:
                     item['status'] = 'others'
 
-        # Fallback for targets still missing viewers or subject
+        # Fallback for any targets still missing viewers or subject
         missing = [item['name'] for item in confirmed_live if item['viewers'] == 0 and not item['subject']]
         if missing:
-            print(f"Running direct mobile extractor for {len(missing)} streamers...")
-            with ThreadPoolExecutor(max_workers=10) as detail_executor:
-                scraped = detail_executor.map(fetch_single_streamer_web_details, missing)
-                for uname, v, s in scraped:
-                    if v > 0 or s:
+            print(f"Fetching direct room context for {len(missing)} streamers...")
+            with ThreadPoolExecutor(max_workers=10) as ctx_executor:
+                direct_results = list(ctx_executor.map(fetch_single_room_context, missing))
+                for name, res_ctx in zip(missing, direct_results):
+                    if res_ctx:
                         for item in confirmed_live:
-                            if item['name'] == uname:
-                                if v > 0: item['viewers'] = v
-                                if s: item['subject'] = s
+                            if item['name'] == name:
+                                if res_ctx['viewers'] > 0:
+                                    item['viewers'] = res_ctx['viewers']
+                                if res_ctx['subject']:
+                                    item['subject'] = res_ctx['subject']
+                                if res_ctx['status'] != 'public':
+                                    item['status'] = res_ctx['status']
 
     # 5. Handle Offline streamers
     status_payload = list(confirmed_live)
