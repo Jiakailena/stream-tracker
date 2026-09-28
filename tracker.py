@@ -70,67 +70,89 @@ def check_live_status_embed(username):
         pass
     return None
 
-def get_runner_public_ip():
-    """Fetches real runner IPv4 to satisfy Chaturbate client_ip validation"""
+def fetch_single_room_context(username):
+    """Direct Chaturbate internal JSON endpoint for exact room viewers & subjects"""
+    url = f"https://chaturbate.com/api/chatvideocontext/{username}/"
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        'Accept': 'application/json',
+        'X-Requested-With': 'XMLHttpRequest'
+    }
     try:
-        r = session.get('https://api.ipify.org', timeout=4)
-        if r.status_code == 200 and re.match(r'^\d+\.\d+\.\d+\.\d+$', r.text.strip()):
-            return r.text.strip()
+        r = session.get(url, headers=headers, timeout=6)
+        if r.status_code == 200:
+            data = r.json()
+            if isinstance(data, dict):
+                viewers = int(data.get('num_users', 0) or 0)
+                subject = str(data.get('room_subject', '') or '').strip()
+                raw_show = str(data.get('room_status', 'public') or '').lower()
+                status = 'public'
+                if raw_show in ['private', 'ticket_show', 'vip']:
+                    status = 'private'
+                elif raw_show in ['away', 'hidden', 'group_show', 'club_show']:
+                    status = 'others'
+                return {'viewers': viewers, 'subject': subject, 'status': status}
     except Exception:
         pass
-    return '1.1.1.1'
+    return None
 
 def fetch_api_details_for_targets(target_names):
-    """
-    Traverses Chaturbate API with verified client_ip and stops early once targets match.
-    """
+    """Fetches global affiliate rooms with explicit format=json and candidate IPs"""
     matched = {}
     remaining = set(target_names)
     if not remaining:
         return matched
 
-    runner_ip = get_runner_public_ip()
-    url = f"https://chaturbate.com/api/public/affiliates/onlinerooms/?wm=9w8Zb&client_ip={runner_ip}&limit=500"
-    print(f"Querying Chaturbate API using runner IP [{runner_ip}] for {len(remaining)} live targets...")
+    candidate_ips = ['1.1.1.1', '104.28.19.45', '8.8.8.8']
 
-    for page in range(1, 18):
-        try:
-            r = session.get(url, timeout=12)
-            if r.status_code != 200:
-                print(f"API notice on page {page}: HTTP {r.status_code}")
-                break
-
-            data = r.json()
-            results = data.get('results', []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
-            if not results:
-                break
-
-            for rm in results:
-                if isinstance(rm, dict):
-                    u = str(rm.get('username', '')).lower()
-                    if u in remaining:
-                        matched[u] = {
-                            'viewers': int(rm.get('num_users', 0) or 0),
-                            'subject': str(rm.get('room_subject', '') or '').strip(),
-                            'show': str(rm.get('current_show', 'public') or '').lower()
-                        }
-                        remaining.remove(u)
-
-            print(f"Page {page}: scanned {len(results)} rooms. Matched {len(matched)}/{len(target_names)} streamers.")
-
-            # Stop scanning immediately when all confirmed live models have their viewers and goals
-            if not remaining:
-                print("All live targets matched successfully!")
-                break
-
-            url = data.get('next') if isinstance(data, dict) else None
-            if not url:
-                break
-
-            time.sleep(0.1)
-        except Exception as e:
-            print(f"Feed error on page {page}: {e}")
+    for test_ip in candidate_ips:
+        if not remaining:
             break
+
+        url = f"https://chaturbate.com/api/public/affiliates/onlinerooms/?wm=9w8Zb&client_ip={test_ip}&limit=500&format=json"
+        print(f"Trying global affiliate API with client_ip={test_ip}...")
+
+        for page in range(1, 16):
+            try:
+                r = session.get(url, timeout=12)
+                if r.status_code != 200:
+                    print(f"API HTTP {r.status_code} on page {page}")
+                    break
+
+                data = r.json()
+                results = data.get('results', []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+                
+                if not results:
+                    print(f"Page {page} returned 0 rooms with IP {test_ip}.")
+                    break
+
+                found_page = 0
+                for rm in results:
+                    if isinstance(rm, dict):
+                        u = str(rm.get('username', '')).lower()
+                        if u in remaining:
+                            matched[u] = {
+                                'viewers': int(rm.get('num_users', 0) or 0),
+                                'subject': str(rm.get('room_subject', '') or '').strip(),
+                                'show': str(rm.get('current_show', 'public') or '').lower()
+                            }
+                            remaining.remove(u)
+                            found_page += 1
+
+                print(f"Page {page}: scanned {len(results)} rooms. Matched {len(matched)}/{len(target_names)} targets.")
+
+                if not remaining:
+                    print("All live targets matched via global API!")
+                    break
+
+                url = data.get('next') if isinstance(data, dict) else None
+                if not url:
+                    break
+
+                time.sleep(0.1)
+            except Exception as e:
+                print(f"Feed error: {e}")
+                break
 
     return matched
 
@@ -168,12 +190,13 @@ def main():
 
     print(f"Detected {len(confirmed_live)} streamers LIVE!")
 
-    # 4. Enrich confirmed live streamers via API Early-Exit Matcher
+    # 4. Enrich live streamers: Try Global API first
     if confirmed_live:
-        print("[2/2] Fetching peak viewers and subjects from official API...")
+        print("[2/2] Fetching peak viewers and room subjects...")
         targets = [item['name'] for item in confirmed_live]
         api_data = fetch_api_details_for_targets(targets)
 
+        # Apply global API data
         for item in confirmed_live:
             name = item['name']
             if name in api_data:
@@ -184,6 +207,21 @@ def main():
                     item['status'] = 'private'
                 elif show in ['away', 'hidden', 'group_show', 'club_show']:
                     item['status'] = 'others'
+
+        # Direct room context fallback for any target still missing viewers/subject
+        missing_details = [item['name'] for item in confirmed_live if item['viewers'] == 0 and not item['subject']]
+        if missing_details:
+            print(f"Fetching direct room context for {len(missing_details)} streamers...")
+            with ThreadPoolExecutor(max_workers=10) as ctx_executor:
+                direct_results = list(ctx_executor.map(fetch_single_room_context, missing_details))
+                for name, res_ctx in zip(missing_details, direct_results):
+                    if res_ctx:
+                        for item in confirmed_live:
+                            if item['name'] == name:
+                                item['viewers'] = res_ctx['viewers']
+                                item['subject'] = res_ctx['subject']
+                                if res_ctx['status'] != 'public':
+                                    item['status'] = res_ctx['status']
 
     # 5. Handle Offline streamers
     status_payload = list(confirmed_live)
