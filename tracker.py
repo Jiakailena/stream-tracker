@@ -13,7 +13,7 @@ ENDPOINT_URL = "https://stacy.infinityfreeapp.com/stream.php"
 TRACKER_SECRET = "jitul_tracker_key_2026"
 
 session = requests.Session()
-adapter = HTTPAdapter(pool_connections=35, pool_maxsize=35, max_retries=Retry(total=1, backoff_factor=0.2))
+adapter = HTTPAdapter(pool_connections=40, pool_maxsize=40, max_retries=Retry(total=1, backoff_factor=0.2))
 session.mount('https://', adapter)
 session.mount('http://', adapter)
 
@@ -45,39 +45,18 @@ def bypass_infinityfree(url):
         print(f"Bypass error: {e}")
         return False
 
-def check_streamer_full_status(username):
-    """Extracts exact room_status, real peak viewers, and room subject directly from embed"""
+def check_live_status_fast(username):
+    """Ultra-fast embed status check"""
     url = f"https://chaturbate.com/embed/{username}/?bgcolor=black"
     try:
-        res = session.get(url, timeout=8)
+        res = session.get(url, timeout=7)
         if res.status_code != 200:
             return None
 
         html = res.text
-        viewers = 0
-        subject = ''
-        mapped_status = 'public'
-        dossier = None
-
-        # 1. Parse initialRoomDossier JSON string
-        m_dossier = re.search(r'initialRoomDossier\s*=\s*(["\'])(.*?)\1\s*;', html, re.DOTALL)
-        if m_dossier:
-            try:
-                raw_json = json.loads(f'"{m_dossier.group(2)}"')
-                dossier = json.loads(raw_json)
-            except Exception:
-                pass
-
-        if not dossier:
-            m_dossier2 = re.search(r'initialRoomDossier\s*=\s*(\{.*?\})\s*;', html, re.DOTALL)
-            if m_dossier2:
-                try:
-                    dossier = json.loads(m_dossier2.group(1))
-                except Exception:
-                    pass
-
-        if dossier and isinstance(dossier, dict):
-            raw_status = str(dossier.get('room_status', '')).lower()
+        status_match = re.search(r'["\']room_status["\']\s*:\s*["\']([a-zA-Z0-9_-]+)["\']', html)
+        if status_match:
+            raw_status = status_match.group(1).lower()
             if raw_status in ['offline', 'disabled']:
                 return None
             elif raw_status in ['private', 'ticket_show', 'vip']:
@@ -86,44 +65,78 @@ def check_streamer_full_status(username):
                 mapped_status = 'others'
             else:
                 mapped_status = 'public'
-
-            viewers = int(dossier.get('num_users', 0) or 0)
-            subject = str(dossier.get('room_subject', '') or '').strip()
         else:
-            # Fallback regex targeting
-            status_match = re.search(r'(?:room_status|\\u0022room_status\\u0022|\\\"room_status\\\")\s*:\s*[\"\\]*([a-zA-Z0-9_-]+)', html)
-            if status_match:
-                raw_status = status_match.group(1).lower()
-                if raw_status in ['offline', 'disabled']:
-                    return None
-                elif raw_status in ['private', 'ticket_show', 'vip']:
-                    mapped_status = 'private'
-                elif raw_status in ['away', 'hidden', 'group_show', 'club_show']:
-                    mapped_status = 'others'
-                else:
-                    mapped_status = 'public'
-            elif '.m3u8' in html or '"is_live": true' in html or '"is_live":true' in html:
+            if '.m3u8' in html or '"is_live": true' in html or '"is_live":true' in html:
                 mapped_status = 'public'
             else:
                 return None
 
-            m_v = re.search(r'(?:num_users|\\u0022num_users\\u0022|\\\"num_users\\\")\s*:\s*(\d+)', html)
-            if m_v:
-                viewers = int(m_v.group(1))
-
-            m_s = re.search(r'(?:room_subject|\\u0022room_subject\\u0022|\\\"room_subject\\\")\s*:\s*[\"\\]*([^\"\\<\n\r]+)', html)
-            if m_s:
-                subject = m_s.group(1).strip()
-
         return {
             'name': username,
             'status': mapped_status,
-            'viewers': viewers,
-            'subject': subject
+            'viewers': 0,
+            'subject': ''
         }
     except Exception:
         pass
     return None
+
+def fetch_chaturbate_api_feed():
+    """Fetches top online rooms from Chaturbate API as quick cache"""
+    url = "https://chaturbate.com/api/public/affiliates/onlinerooms/?wm=9w8Zb&client_ip=request_ip&format=json"
+    headers = {'User-Agent': 'Mozilla/5.0'}
+    rooms_map = {}
+    try:
+        r = session.get(url, headers=headers, timeout=15)
+        if r.status_code == 200:
+            data = r.json()
+            results = data.get('results', []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+            for rm in results:
+                u = rm.get('username', '').lower()
+                if u:
+                    rooms_map[u] = {
+                        'viewers': int(rm.get('num_users', 0) or 0),
+                        'subject': str(rm.get('room_subject', '') or '').strip()
+                    }
+    except Exception as e:
+        print(f"API feed notice: {e}")
+    return rooms_map
+
+def fetch_live_details_from_page(username):
+    """Directly extracts viewers and subject from main room page with age-bypass cookies"""
+    url = f"https://chaturbate.com/{username}/"
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    }
+    cookies = {
+        'ag_consent': '1',
+        'age_verified': '1',
+        'consent_accepted': '1',
+        'warning_accepted': '1',
+        'has_accepted_terms': '1'
+    }
+    viewers = 0
+    subject = ''
+    try:
+        r = session.get(url, headers=headers, cookies=cookies, timeout=7)
+        if r.status_code == 200:
+            html = r.text
+            # Extract viewers
+            mv = re.search(r'(?:num_users|\\u0022num_users\\u0022|\\\"num_users\\\")\s*:\s*(\d+)', html)
+            if mv:
+                viewers = int(mv.group(1))
+
+            # Extract subject
+            ms = re.search(r'(?:room_subject|\\u0022room_subject\\u0022|\\\"room_subject\\\")\s*:\s*[\"\\]*([^\"\\<\r\n]+)', html)
+            if ms:
+                sub_raw = ms.group(1).strip()
+                try:
+                    subject = bytes(sub_raw, "utf-8").decode("unicode_escape")
+                except Exception:
+                    subject = sub_raw
+    except Exception:
+        pass
+    return viewers, subject
 
 def main():
     # 1. Bypass InfinityFree Security
@@ -143,24 +156,38 @@ def main():
         return
 
     saved_set = [s['name'].lower() for s in raw_streamers]
-    print(f"Checking {len(saved_set)} streamers with high accuracy...")
+    print(f"Verifying {len(saved_set)} streamers with multi-threading...")
 
-    # 3. Concurrent live checks
-    status_payload = []
+    # 3. Parallel live checks
+    confirmed_live = []
     found_online = set()
 
-    start_t = time.time()
     with ThreadPoolExecutor(max_workers=25) as executor:
-        results = executor.map(check_streamer_full_status, saved_set)
+        results = executor.map(check_live_status_fast, saved_set)
         for r in results:
             if r:
-                status_payload.append(r)
+                confirmed_live.append(r)
                 found_online.add(r['name'])
 
-    elapsed = round(time.time() - start_t, 2)
-    print(f"Scan finished in {elapsed}s: Found {len(found_online)} LIVE out of {len(saved_set)} streamers.")
+    print(f"Detected {len(confirmed_live)} LIVE streamers! Fetching viewers & room subjects...")
 
-    # 4. Offline Streamers
+    # 4. Fetch Chaturbate API top rooms for instant data
+    api_rooms = fetch_chaturbate_api_feed()
+
+    # 5. Enrich live streamers with peak viewers & subjects
+    status_payload = []
+    for item in confirmed_live:
+        name = item['name']
+        if name in api_rooms and api_rooms[name]['viewers'] > 0:
+            item['viewers'] = api_rooms[name]['viewers']
+            item['subject'] = api_rooms[name]['subject']
+        else:
+            v, s = fetch_live_details_from_page(name)
+            item['viewers'] = v
+            item['subject'] = s
+        status_payload.append(item)
+
+    # 6. Offline streamers
     for name in set(saved_set) - found_online:
         status_payload.append({
             'name': name,
@@ -169,7 +196,9 @@ def main():
             'subject': ''
         })
 
-    # 5. Push to Database
+    print(f"Payload ready: {len(confirmed_live)} LIVE (with viewers/subjects), {len(saved_set) - len(confirmed_live)} OFFLINE.")
+
+    # 7. Push to Database
     try:
         sync_res = session.post(ENDPOINT_URL, data={
             'action': 'sync_tracker',
