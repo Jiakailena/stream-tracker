@@ -13,7 +13,7 @@ ENDPOINT_URL = "https://stacy.infinityfreeapp.com/stream.php"
 TRACKER_SECRET = "jitul_tracker_key_2026"
 
 session = requests.Session()
-adapter = HTTPAdapter(pool_connections=40, pool_maxsize=40, max_retries=Retry(total=1, backoff_factor=0.2))
+adapter = HTTPAdapter(pool_connections=30, pool_maxsize=30, max_retries=Retry(total=1, backoff_factor=0.2))
 session.mount('https://', adapter)
 session.mount('http://', adapter)
 
@@ -23,7 +23,7 @@ session.headers.update({
 })
 
 def bypass_infinityfree(url):
-    """Bypasses InfinityFree's aes.js firewall challenge automatically"""
+    """Bypasses InfinityFree's aes.js firewall automatically"""
     try:
         res = session.get(url, timeout=12)
         if 'slowAES.decrypt' in res.text:
@@ -45,102 +45,98 @@ def bypass_infinityfree(url):
         print(f"Bypass error: {e}")
         return False
 
-def check_live_status_fast(username):
-    """Ultra-fast embed status check"""
-    url = f"https://chaturbate.com/embed/{username}/?bgcolor=black"
+def fetch_chaturbate_global_feed():
+    """
+    Sequentially traverses Chaturbate's official API feed using 'next' URLs.
+    Takes only 2-3 seconds total because of persistent HTTP connection reuse.
+    """
+    rooms_map = {}
+    url = "https://chaturbate.com/api/public/affiliates/onlinerooms/?wm=9w8Zb&client_ip=request_ip&format=json&limit=500"
+    headers = {'User-Agent': 'Mozilla/5.0'}
+
+    print("Fetching worldwide online rooms from Chaturbate API...")
+    for page in range(16):
+        try:
+            r = session.get(url, headers=headers, timeout=15)
+            if r.status_code != 200:
+                print(f"API notice on page {page+1}: status {r.status_code}")
+                break
+            
+            data = r.json()
+            results = data.get('results', []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+            if not results:
+                break
+
+            for rm in results:
+                if isinstance(rm, dict):
+                    u = rm.get('username', '').lower()
+                    if u:
+                        rooms_map[u] = {
+                            'viewers': int(rm.get('num_users', 0) or 0),
+                            'subject': str(rm.get('room_subject', '') or '').strip(),
+                            'show': str(rm.get('current_show', 'public') or '').lower()
+                        }
+
+            url = data.get('next') if isinstance(data, dict) else None
+            if not url:
+                break
+        except Exception as e:
+            print(f"Feed error on page {page+1}: {e}")
+            break
+
+    print(f"API Feed fetched {len(rooms_map)} active rooms worldwide.")
+    return rooms_map
+
+def direct_check_unmapped_streamer(username):
+    """20-Worker Concurrency fallback for missing streamers"""
+    url = f"https://chaturbate.com/{username}/"
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+    }
+    cookies = {
+        'ag_consent': '1', 'age_verified': '1', 'consent_accepted': '1', 'warning_accepted': '1'
+    }
     try:
-        res = session.get(url, timeout=7)
-        if res.status_code != 200:
-            return None
+        res = session.get(url, headers=headers, cookies=cookies, timeout=7)
+        if res.status_code == 200:
+            html = res.text
+            clean_html = html.replace('\\u0022', '"').replace('\\"', '"')
 
-        html = res.text
-        status_match = re.search(r'["\']room_status["\']\s*:\s*["\']([a-zA-Z0-9_-]+)["\']', html)
-        if status_match:
-            raw_status = status_match.group(1).lower()
-            if raw_status in ['offline', 'disabled']:
-                return None
-            elif raw_status in ['private', 'ticket_show', 'vip']:
-                mapped_status = 'private'
-            elif raw_status in ['away', 'hidden', 'group_show', 'club_show']:
-                mapped_status = 'others'
-            else:
-                mapped_status = 'public'
-        else:
-            if '.m3u8' in html or '"is_live": true' in html or '"is_live":true' in html:
-                mapped_status = 'public'
-            else:
-                return None
+            status_match = re.search(r'"room_status"\s*:\s*"([a-zA-Z0-9_-]+)"', clean_html)
+            if status_match:
+                raw_status = status_match.group(1).lower()
+                if raw_status in ['offline', 'disabled']:
+                    return None
 
-        return {
-            'name': username,
-            'status': mapped_status,
-            'viewers': 0,
-            'subject': ''
-        }
+                mapped_status = 'public'
+                if raw_status in ['private', 'ticket_show', 'vip']:
+                    mapped_status = 'private'
+                elif raw_status in ['away', 'hidden', 'group_show', 'club_show']:
+                    mapped_status = 'others'
+
+                viewers = 0
+                mv = re.search(r'"num_users"\s*:\s*(\d+)', clean_html)
+                if mv:
+                    viewers = int(mv.group(1))
+
+                subject = ''
+                ms = re.search(r'"room_subject"\s*:\s*"([^"]*)"', clean_html)
+                if ms:
+                    sub_raw = ms.group(1).strip()
+                    try:
+                        subject = bytes(sub_raw, 'utf-8').decode('unicode_escape')
+                    except Exception:
+                        subject = sub_raw
+
+                return {
+                    'name': username,
+                    'status': mapped_status,
+                    'viewers': viewers,
+                    'subject': subject
+                }
     except Exception:
         pass
     return None
-
-def fetch_chaturbate_api_feed():
-    """Fetches top online rooms from Chaturbate API as quick cache"""
-    url = "https://chaturbate.com/api/public/affiliates/onlinerooms/?wm=9w8Zb&client_ip=request_ip&format=json"
-    headers = {'User-Agent': 'Mozilla/5.0'}
-    rooms_map = {}
-    try:
-        r = session.get(url, headers=headers, timeout=15)
-        if r.status_code == 200:
-            data = r.json()
-            results = data.get('results', []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
-            for rm in results:
-                u = rm.get('username', '').lower()
-                if u:
-                    rooms_map[u] = {
-                        'viewers': int(rm.get('num_users', 0) or 0),
-                        'subject': str(rm.get('room_subject', '') or '').strip()
-                    }
-    except Exception as e:
-        print(f"API feed notice: {e}")
-    return rooms_map
-
-def fetch_live_details_from_page(username):
-    """Directly extracts viewers and subject from main room page with unicode unescaping"""
-    url = f"https://chaturbate.com/{username}/"
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-    }
-    cookies = {
-        'ag_consent': '1',
-        'age_verified': '1',
-        'consent_accepted': '1',
-        'warning_accepted': '1',
-        'has_accepted_terms': '1'
-    }
-    viewers = 0
-    subject = ''
-    try:
-        r = session.get(url, headers=headers, cookies=cookies, timeout=8)
-        if r.status_code == 200:
-            html = r.text
-            # Unescape unicode quotes to make regex match 100% of the time
-            clean_html = html.replace('\\u0022', '"').replace('\\"', '"')
-
-            # 1. Match Viewers
-            mv = re.search(r'"num_users"\s*:\s*(\d+)', clean_html)
-            if mv:
-                viewers = int(mv.group(1))
-
-            # 2. Match Subject / Goal
-            ms = re.search(r'"room_subject"\s*:\s*"([^"]*)"', clean_html)
-            if ms:
-                sub_text = ms.group(1).strip()
-                try:
-                    subject = bytes(sub_text, 'utf-8').decode('unicode_escape')
-                except Exception:
-                    subject = sub_text
-    except Exception:
-        pass
-    return viewers, subject
 
 def main():
     # 1. Bypass InfinityFree Security
@@ -156,42 +152,47 @@ def main():
         return
 
     if not raw_streamers:
-        print("No saved streamers found.")
+        print("No saved streamers found in library.")
         return
 
     saved_set = [s['name'].lower() for s in raw_streamers]
-    print(f"Verifying {len(saved_set)} streamers with multi-threading...")
+    print(f"Tracking {len(saved_set)} streamers...")
 
-    # 3. Parallel live checks
-    confirmed_live = []
+    # 3. Fetch worldwide API feed (Scalable for 10,000+ models)
+    global_rooms = fetch_chaturbate_global_feed()
+
+    # 4. Instant O(1) matching
+    status_payload = []
     found_online = set()
 
-    with ThreadPoolExecutor(max_workers=25) as executor:
-        results = executor.map(check_live_status_fast, saved_set)
-        for r in results:
-            if r:
-                confirmed_live.append(r)
-                found_online.add(r['name'])
+    for name in saved_set:
+        if name in global_rooms:
+            rm = global_rooms[name]
+            show = rm['show']
+            mapped_status = 'public'
+            if show in ['private', 'ticket_show']:
+                mapped_status = 'private'
+            elif show in ['away', 'hidden', 'group_show', 'club_show']:
+                mapped_status = 'others'
 
-    print(f"Detected {len(confirmed_live)} LIVE streamers! Fetching viewers & room subjects...")
+            status_payload.append({
+                'name': name,
+                'status': mapped_status,
+                'viewers': rm['viewers'],
+                'subject': rm['subject']
+            })
+            found_online.add(name)
 
-    # 4. Fetch Chaturbate API top rooms cache
-    api_rooms = fetch_chaturbate_api_feed()
-
-    # 5. Enrich live streamers with peak viewers & room subjects
-    status_payload = []
-    for item in confirmed_live:
-        name = item['name']
-        if name in api_rooms and api_rooms[name]['viewers'] > 0:
-            item['viewers'] = api_rooms[name]['viewers']
-            item['subject'] = api_rooms[name]['subject']
-            print(f"[{name}] API Match -> Viewers: {item['viewers']}, Subject: '{item['subject']}'")
-        else:
-            v, s = fetch_live_details_from_page(name)
-            item['viewers'] = v
-            item['subject'] = s
-            print(f"[{name}] Page Scrape -> Viewers: {item['viewers']}, Subject: '{item['subject']}'")
-        status_payload.append(item)
+    # 5. Fast Multi-threaded 20-Workers Check for any missing models
+    unmapped = [name for name in saved_set if name not in found_online]
+    if unmapped:
+        print(f"Checking {len(unmapped)} unmapped streamers with 20 parallel workers...")
+        with ThreadPoolExecutor(max_workers=20) as executor:
+            direct_results = executor.map(direct_check_unmapped_streamer, unmapped)
+            for r in direct_results:
+                if r:
+                    status_payload.append(r)
+                    found_online.add(r['name'])
 
     # 6. Offline streamers
     for name in set(saved_set) - found_online:
@@ -202,9 +203,16 @@ def main():
             'subject': ''
         })
 
-    print(f"Payload ready: {len(confirmed_live)} LIVE, {len(saved_set) - len(confirmed_live)} OFFLINE.")
+    # Terminal Log Output
+    live_count = sum(1 for x in status_payload if x['status'] != 'offline')
+    print(f"\n--- VERIFIED STATUS REPORT ---")
+    print(f"Total LIVE: {live_count}, Total OFFLINE: {len(saved_set) - live_count}")
+    for item in status_payload:
+        if item['status'] != 'offline':
+            print(f"-> [{item['name'].upper()}] Status: {item['status']} | Viewers: {item['viewers']} | Subject: '{item['subject']}'")
+    print("------------------------------\n")
 
-    # 7. Push to Database
+    # 7. Push 1 single payload to database
     try:
         sync_res = session.post(ENDPOINT_URL, data={
             'action': 'sync_tracker',
