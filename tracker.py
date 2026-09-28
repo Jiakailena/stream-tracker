@@ -23,7 +23,7 @@ session.headers.update({
 })
 
 def bypass_infinityfree(url):
-    """Bypasses InfinityFree's aes.js firewall automatically"""
+    """Bypasses InfinityFree's aes.js firewall challenge automatically"""
     try:
         res = session.get(url, timeout=12)
         if 'slowAES.decrypt' in res.text:
@@ -103,10 +103,11 @@ def fetch_chaturbate_api_feed():
     return rooms_map
 
 def fetch_live_details_from_page(username):
-    """Directly extracts viewers and subject from main room page with age-bypass cookies"""
+    """Directly extracts viewers and subject from main room page with unicode unescaping"""
     url = f"https://chaturbate.com/{username}/"
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
     }
     cookies = {
         'ag_consent': '1',
@@ -118,22 +119,25 @@ def fetch_live_details_from_page(username):
     viewers = 0
     subject = ''
     try:
-        r = session.get(url, headers=headers, cookies=cookies, timeout=7)
+        r = session.get(url, headers=headers, cookies=cookies, timeout=8)
         if r.status_code == 200:
             html = r.text
-            # Extract viewers
-            mv = re.search(r'(?:num_users|\\u0022num_users\\u0022|\\\"num_users\\\")\s*:\s*(\d+)', html)
+            # Unescape unicode quotes to make regex match 100% of the time
+            clean_html = html.replace('\\u0022', '"').replace('\\"', '"')
+
+            # 1. Match Viewers
+            mv = re.search(r'"num_users"\s*:\s*(\d+)', clean_html)
             if mv:
                 viewers = int(mv.group(1))
 
-            # Extract subject
-            ms = re.search(r'(?:room_subject|\\u0022room_subject\\u0022|\\\"room_subject\\\")\s*:\s*[\"\\]*([^\"\\<\r\n]+)', html)
+            # 2. Match Subject / Goal
+            ms = re.search(r'"room_subject"\s*:\s*"([^"]*)"', clean_html)
             if ms:
-                sub_raw = ms.group(1).strip()
+                sub_text = ms.group(1).strip()
                 try:
-                    subject = bytes(sub_raw, "utf-8").decode("unicode_escape")
+                    subject = bytes(sub_text, 'utf-8').decode('unicode_escape')
                 except Exception:
-                    subject = sub_raw
+                    subject = sub_text
     except Exception:
         pass
     return viewers, subject
@@ -171,20 +175,22 @@ def main():
 
     print(f"Detected {len(confirmed_live)} LIVE streamers! Fetching viewers & room subjects...")
 
-    # 4. Fetch Chaturbate API top rooms for instant data
+    # 4. Fetch Chaturbate API top rooms cache
     api_rooms = fetch_chaturbate_api_feed()
 
-    # 5. Enrich live streamers with peak viewers & subjects
+    # 5. Enrich live streamers with peak viewers & room subjects
     status_payload = []
     for item in confirmed_live:
         name = item['name']
         if name in api_rooms and api_rooms[name]['viewers'] > 0:
             item['viewers'] = api_rooms[name]['viewers']
             item['subject'] = api_rooms[name]['subject']
+            print(f"[{name}] API Match -> Viewers: {item['viewers']}, Subject: '{item['subject']}'")
         else:
             v, s = fetch_live_details_from_page(name)
             item['viewers'] = v
             item['subject'] = s
+            print(f"[{name}] Page Scrape -> Viewers: {item['viewers']}, Subject: '{item['subject']}'")
         status_payload.append(item)
 
     # 6. Offline streamers
@@ -196,7 +202,7 @@ def main():
             'subject': ''
         })
 
-    print(f"Payload ready: {len(confirmed_live)} LIVE (with viewers/subjects), {len(saved_set) - len(confirmed_live)} OFFLINE.")
+    print(f"Payload ready: {len(confirmed_live)} LIVE, {len(saved_set) - len(confirmed_live)} OFFLINE.")
 
     # 7. Push to Database
     try:
