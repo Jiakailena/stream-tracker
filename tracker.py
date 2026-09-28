@@ -70,19 +70,28 @@ def check_live_status_embed(username):
         pass
     return None
 
+def get_runner_public_ip():
+    """Fetches real runner IPv4 to satisfy Chaturbate client_ip validation"""
+    try:
+        r = session.get('https://api.ipify.org', timeout=4)
+        if r.status_code == 200 and re.match(r'^\d+\.\d+\.\d+\.\d+$', r.text.strip()):
+            return r.text.strip()
+    except Exception:
+        pass
+    return '1.1.1.1'
+
 def fetch_api_details_for_targets(target_names):
     """
-    Sequentially traverses Chaturbate's official API feed.
-    Stops immediately as soon as all target live streamers are matched.
+    Traverses Chaturbate API with verified client_ip and stops early once targets match.
     """
     matched = {}
     remaining = set(target_names)
     if not remaining:
         return matched
 
-    # Clean official URL without client_ip bug
-    url = "https://chaturbate.com/api/public/affiliates/onlinerooms/?wm=9w8Zb&limit=500"
-    print(f"Searching official API feed for {len(remaining)} live targets...")
+    runner_ip = get_runner_public_ip()
+    url = f"https://chaturbate.com/api/public/affiliates/onlinerooms/?wm=9w8Zb&client_ip={runner_ip}&limit=500"
+    print(f"Querying Chaturbate API using runner IP [{runner_ip}] for {len(remaining)} live targets...")
 
     for page in range(1, 18):
         try:
@@ -96,7 +105,6 @@ def fetch_api_details_for_targets(target_names):
             if not results:
                 break
 
-            found_page = 0
             for rm in results:
                 if isinstance(rm, dict):
                     u = str(rm.get('username', '')).lower()
@@ -107,20 +115,19 @@ def fetch_api_details_for_targets(target_names):
                             'show': str(rm.get('current_show', 'public') or '').lower()
                         }
                         remaining.remove(u)
-                        found_page += 1
 
             print(f"Page {page}: scanned {len(results)} rooms. Matched {len(matched)}/{len(target_names)} streamers.")
 
-            # Instant Early Stop when all targets are matched!
+            # Stop scanning immediately when all confirmed live models have their viewers and goals
             if not remaining:
-                print("All live streamers matched with viewers and subjects!")
+                print("All live targets matched successfully!")
                 break
 
             url = data.get('next') if isinstance(data, dict) else None
             if not url:
                 break
 
-            time.sleep(0.1) # Safe gentle gap
+            time.sleep(0.1)
         except Exception as e:
             print(f"Feed error on page {page}: {e}")
             break
