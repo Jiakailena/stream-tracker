@@ -2,7 +2,6 @@ import json
 import re
 import sys
 import time
-import subprocess
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util import Retry
@@ -18,13 +17,11 @@ adapter = HTTPAdapter(pool_connections=35, pool_maxsize=35, max_retries=Retry(to
 session.mount('https://', adapter)
 session.mount('http://', adapter)
 
-BROWSER_HEADERS = {
+session.headers.update({
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
     'Accept': 'application/json, text/plain, */*',
-    'Accept-Language': 'en-US,en;q=0.9',
-    'Accept-Encoding': 'gzip, deflate'
-}
-session.headers.update(BROWSER_HEADERS)
+    'Accept-Language': 'en-US,en;q=0.9'
+})
 
 def bypass_infinityfree(url):
     """Bypasses InfinityFree's aes.js firewall automatically"""
@@ -50,7 +47,7 @@ def bypass_infinityfree(url):
         return False
 
 def check_live_status_embed(username):
-    """Fast reliable live status detector via embed"""
+    """Fast, reliable 20-worker live status detector via embed"""
     url = f"https://chaturbate.com/embed/{username}/?bgcolor=black"
     try:
         res = session.get(url, timeout=7)
@@ -73,115 +70,68 @@ def check_live_status_embed(username):
         pass
     return None
 
-def fetch_feed_with_curl(url):
-    """Bypasses Cloudflare TLS fingerprint blocks using Linux native curl"""
-    try:
-        cmd = [
-            'curl', '-sL', '--compressed',
-            '-H', 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-            '-H', 'Accept: application/json',
-            url
-        ]
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=25)
-        if res.returncode == 0 and res.stdout.strip():
-            return json.loads(res.stdout)
-    except Exception as e:
-        print(f"Curl notice: {e}")
-    return None
+def fetch_api_details_for_targets(target_names):
+    """
+    Sequentially traverses Chaturbate's official API feed.
+    Stops immediately as soon as all target live streamers are matched.
+    """
+    matched = {}
+    remaining = set(target_names)
+    if not remaining:
+        return matched
 
-def fetch_global_chaturbate_rooms():
-    """Fetches worldwide active rooms with viewers and subjects"""
-    rooms_map = {}
-    
-    # Try 1: Bulk Feed via Curl
-    print("[1/3] Fetching global bulk room feed via curl...")
-    bulk_url = "https://chaturbate.com/affiliates/api/onlinerooms/?format=json&wm=9w8Zb"
-    data = fetch_feed_with_curl(bulk_url)
-    
-    # Try 2: Python requests if curl returned None
-    if not data:
+    # Clean official URL without client_ip bug
+    url = "https://chaturbate.com/api/public/affiliates/onlinerooms/?wm=9w8Zb&limit=500"
+    print(f"Searching official API feed for {len(remaining)} live targets...")
+
+    for page in range(1, 18):
         try:
-            r = session.get(bulk_url, timeout=25)
-            if r.status_code == 200:
-                data = r.json()
-        except Exception:
-            pass
+            r = session.get(url, timeout=12)
+            if r.status_code != 200:
+                print(f"API notice on page {page}: HTTP {r.status_code}")
+                break
 
-    items = data if isinstance(data, list) else (data.get('results', []) if isinstance(data, dict) else [])
-    
-    if len(items) > 100:
-        print(f"Loaded {len(items)} worldwide active rooms successfully!")
-        for rm in items:
-            if isinstance(rm, dict):
-                u = rm.get('username', '').lower()
-                if u:
-                    rooms_map[u] = {
-                        'viewers': int(rm.get('num_users', 0) or 0),
-                        'subject': str(rm.get('room_subject', '') or '').strip(),
-                        'show': str(rm.get('current_show', 'public') or '').lower()
-                    }
-        return rooms_map
+            data = r.json()
+            results = data.get('results', []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+            if not results:
+                break
 
-    # Try 3: Paged Affiliate API via Curl
-    print("Bulk feed empty, falling back to paged API...")
-    paged_url = "https://chaturbate.com/api/public/affiliates/onlinerooms/?wm=9w8Zb&client_ip=request_ip&format=json&limit=500"
-    for page in range(16):
-        data = fetch_feed_with_curl(paged_url)
-        if not data:
-            break
-        results = data.get('results', []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
-        if not results:
-            break
-        for rm in results:
-            if isinstance(rm, dict):
-                u = rm.get('username', '').lower()
-                if u:
-                    rooms_map[u] = {
-                        'viewers': int(rm.get('num_users', 0) or 0),
-                        'subject': str(rm.get('room_subject', '') or '').strip(),
-                        'show': str(rm.get('current_show', 'public') or '').lower()
-                    }
-        paged_url = data.get('next') if isinstance(data, dict) else None
-        if not paged_url:
+            found_page = 0
+            for rm in results:
+                if isinstance(rm, dict):
+                    u = str(rm.get('username', '')).lower()
+                    if u in remaining:
+                        matched[u] = {
+                            'viewers': int(rm.get('num_users', 0) or 0),
+                            'subject': str(rm.get('room_subject', '') or '').strip(),
+                            'show': str(rm.get('current_show', 'public') or '').lower()
+                        }
+                        remaining.remove(u)
+                        found_page += 1
+
+            print(f"Page {page}: scanned {len(results)} rooms. Matched {len(matched)}/{len(target_names)} streamers.")
+
+            # Instant Early Stop when all targets are matched!
+            if not remaining:
+                print("All live streamers matched with viewers and subjects!")
+                break
+
+            url = data.get('next') if isinstance(data, dict) else None
+            if not url:
+                break
+
+            time.sleep(0.1) # Safe gentle gap
+        except Exception as e:
+            print(f"Feed error on page {page}: {e}")
             break
 
-    print(f"Paged API loaded {len(rooms_map)} active rooms.")
-    return rooms_map
-
-def fetch_single_room_via_curl(username):
-    """Direct room scrape fallback via curl"""
-    url = f"https://chaturbate.com/{username}/"
-    viewers = 0
-    subject = ''
-    try:
-        cmd = [
-            'curl', '-sL', '--compressed',
-            '-H', 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-            '-b', 'ag_consent=1; age_verified=1; warning_accepted=1',
-            url
-        ]
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=8)
-        if res.returncode == 0 and res.stdout:
-            html = res.stdout.replace('\\u0022', '"').replace('\\"', '"')
-            mv = re.search(r'"num_users"\s*:\s*(\d+)', html)
-            if mv:
-                viewers = int(mv.group(1))
-            ms = re.search(r'"room_subject"\s*:\s*"([^"]*)"', html)
-            if ms:
-                sub_raw = ms.group(1).strip()
-                try:
-                    subject = bytes(sub_raw, 'utf-8').decode('unicode_escape')
-                except Exception:
-                    subject = sub_raw
-    except Exception:
-        pass
-    return viewers, subject
+    return matched
 
 def main():
-    # 1. InfinityFree Firewall
+    # 1. InfinityFree Firewall Bypass
     bypass_infinityfree(ENDPOINT_URL)
 
-    # 2. Load streamers from DB
+    # 2. Load streamers from database
     try:
         res = session.post(ENDPOINT_URL, data={'action': 'load_all'}, timeout=15)
         site_data = res.json()
@@ -197,8 +147,8 @@ def main():
     saved_set = [s['name'].lower() for s in raw_streamers]
     print(f"Total streamers in library: {len(saved_set)}")
 
-    # 3. Fast Parallel Embed Status Check (20 workers)
-    print("[2/3] Verifying online streamers with 20 parallel workers...")
+    # 3. High-Speed 20-Workers Concurrency Live Verification
+    print("[1/2] Verifying live status with 20 parallel workers...")
     confirmed_live = []
     found_online = set()
 
@@ -211,32 +161,25 @@ def main():
 
     print(f"Detected {len(confirmed_live)} streamers LIVE!")
 
-    # 4. Global API Rooms Feed via Curl
-    global_rooms = fetch_global_chaturbate_rooms()
+    # 4. Enrich confirmed live streamers via API Early-Exit Matcher
+    if confirmed_live:
+        print("[2/2] Fetching peak viewers and subjects from official API...")
+        targets = [item['name'] for item in confirmed_live]
+        api_data = fetch_api_details_for_targets(targets)
 
-    # 5. Enrich live streamers with Viewers & Subject
-    status_payload = []
-    for item in confirmed_live:
-        name = item['name']
-        if name in global_rooms and global_rooms[name]['viewers'] > 0:
-            item['viewers'] = global_rooms[name]['viewers']
-            item['subject'] = global_rooms[name]['subject']
-            show = global_rooms[name]['show']
-            if show in ['private', 'ticket_show']:
-                item['status'] = 'private'
-            elif show in ['away', 'hidden', 'group_show', 'club_show']:
-                item['status'] = 'others'
-        else:
-            # Fallback direct curl
-            v, s = fetch_single_room_via_curl(name)
-            if v > 0:
-                item['viewers'] = v
-            if s:
-                item['subject'] = s
+        for item in confirmed_live:
+            name = item['name']
+            if name in api_data:
+                item['viewers'] = api_data[name]['viewers']
+                item['subject'] = api_data[name]['subject']
+                show = api_data[name]['show']
+                if show in ['private', 'ticket_show']:
+                    item['status'] = 'private'
+                elif show in ['away', 'hidden', 'group_show', 'club_show']:
+                    item['status'] = 'others'
 
-        status_payload.append(item)
-
-    # 6. Offline streamers
+    # 5. Handle Offline streamers
+    status_payload = list(confirmed_live)
     for name in set(saved_set) - found_online:
         status_payload.append({
             'name': name,
@@ -252,8 +195,8 @@ def main():
             print(f"-> [{item['name'].upper()}] Status: {item['status']} | Viewers: {item['viewers']} | Subject: '{item['subject']}'")
     print(f"Summary: {len(confirmed_live)} LIVE, {len(saved_set) - len(confirmed_live)} OFFLINE.\n")
 
-    # 7. Push to Database
-    print("[3/3] Syncing live data to database...")
+    # 6. Push to Database
+    print("Syncing verified stats to database...")
     try:
         sync_res = session.post(ENDPOINT_URL, data={
             'action': 'sync_tracker',
