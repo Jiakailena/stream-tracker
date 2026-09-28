@@ -4,7 +4,7 @@ Live Lounge - Stream Tracker (tracker.py)
 ------------------------------------------
 - 20-Worker concurrent embed scraper (https://chaturbate.com/embed/{username}/?bgcolor=black)
 - Extracts `num_viewers`, `room_status`, and `room_subject` directly from embed JS
-- Automated InfinityFree AES cookie challenge bypass
+- Subdomain-aware InfinityFree AES cookie firewall bypass
 - Syncs tracked state & continuous session metadata back to stream.php
 """
 
@@ -14,6 +14,7 @@ import sys
 import time
 import json
 import html
+import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 from requests.adapters import HTTPAdapter
@@ -90,21 +91,41 @@ class InfinityFreeSession(requests.Session):
             )
 
     def request(self, method, url, *args, **kwargs):
-        resp = super().request(method, url, *args, **kwargs)
+        # Allow up to 3 challenge-response iterations
+        for attempt in range(3):
+            resp = super().request(method, url, *args, **kwargs)
 
-        # Check if InfinityFree served the JavaScript test challenge page
-        if resp.status_code == 200 and ("slowAES.decrypt" in resp.text or "toNumbers" in resp.text):
-            print("[INFO] InfinityFree AES challenge detected. Solving __test cookie...")
-            a_match = re.search(r'a=toNumbers\("([a-f0-9]+)"\)', resp.text)
-            b_match = re.search(r'b=toNumbers\("([a-f0-9]+)"\)', resp.text)
-            c_match = re.search(r'c=toNumbers\("([a-f0-9]+)"\)', resp.text)
+            # Check if InfinityFree served the JavaScript test challenge page
+            if resp.status_code == 200 and ("slowAES.decrypt" in resp.text or "toNumbers" in resp.text):
+                print(f"[INFO] InfinityFree AES challenge detected (pass {attempt + 1}). Solving __test cookie...")
+                a_match = re.search(r'a=toNumbers\("([a-f0-9]+)"\)', resp.text)
+                b_match = re.search(r'b=toNumbers\("([a-f0-9]+)"\)', resp.text)
+                c_match = re.search(r'c=toNumbers\("([a-f0-9]+)"\)', resp.text)
 
-            if a_match and b_match and c_match:
-                cookie_val = self._solve_aes(a_match.group(1), b_match.group(1), c_match.group(1))
-                self.cookies.set("__test", cookie_val, domain="infinityfreeapp.com")
-                print(f"[OK] Solved __test cookie: {cookie_val[:12]}...")
-                # Re-issue original request with the fresh verification cookie
-                return super().request(method, url, *args, **kwargs)
+                if a_match and b_match and c_match:
+                    cookie_val = self._solve_aes(a_match.group(1), b_match.group(1), c_match.group(1))
+                    parsed = urllib.parse.urlparse(url)
+                    host = parsed.hostname or "stacy.infinityfreeapp.com"
+
+                    # 1. Bind to exact subdomain
+                    self.cookies.set("__test", cookie_val, domain=host, path="/")
+                    # 2. Bind with leading dot for subdomain matching
+                    self.cookies.set("__test", cookie_val, domain=f".{host}", path="/")
+                    # 3. Bind to root domain
+                    parts = host.split(".")
+                    if len(parts) >= 2:
+                        root_domain = "." + ".".join(parts[-2:])
+                        self.cookies.set("__test", cookie_val, domain=root_domain, path="/")
+                    # 4. Inject directly into headers to guarantee transmission
+                    self.headers["Cookie"] = f"__test={cookie_val}"
+
+                    print(f"[OK] Solved __test cookie: {cookie_val[:12]}... (applied to {host})")
+                    continue
+                else:
+                    print("[WARN] Could not parse slowAES parameters from challenge page.")
+                    return resp
+
+            return resp
 
         return resp
 
@@ -117,14 +138,11 @@ def clean_subject_string(raw: str) -> str:
     if not raw:
         return ""
     try:
-        # Resolve \\uXXXX characters
         decoded = re.sub(r'\\u([0-9a-fA-F]{4})', lambda m: chr(int(m.group(1), 16)), raw)
     except Exception:
         decoded = raw
 
-    # Unescape HTML entities (&amp;, &#39;, etc.)
     decoded = html.unescape(decoded)
-    # Strip escaped slashes/quotes
     decoded = decoded.replace(r'\"', '"').replace(r'\/', '/')
     return re.sub(r'\s+', ' ', decoded).strip()
 
@@ -132,7 +150,7 @@ def clean_subject_string(raw: str) -> str:
 def parse_embed_html(username: str, html_text: str) -> dict:
     """
     Parses the embed page HTML directly for room_status, num_viewers, and room_subject.
-    Handles both raw quotes (`"`), escaped quotes (`\\"`), and JS unicode quotes (`\\u0022`).
+    Handles raw quotes, escaped quotes, and JS unicode escapes.
     """
     result = {
         "username": username,
@@ -147,7 +165,7 @@ def parse_embed_html(username: str, html_text: str) -> dict:
     if not html_text:
         return result
 
-    # 1. Extract Room Status
+    # 1. Room Status
     status_patterns = [
         r'(?:\\u0022|\\"|")room_status(?:\\u0022|\\"|")\s*:\s*(?:\\u0022|\\"|")([a-zA-Z0-9_\-]+)(?:\\u0022|\\"|")',
         r'(?:\\u0022|\\"|")status(?:\\u0022|\\"|")\s*:\s*(?:\\u0022|\\"|")([a-zA-Z0-9_\-]+)(?:\\u0022|\\"|")',
@@ -160,7 +178,7 @@ def parse_embed_html(username: str, html_text: str) -> dict:
             raw_status = m.group(1).lower().strip()
             break
 
-    # 2. Extract Real-Time Viewer Count (Matches \u0022num_viewers\u0022: 6328)
+    # 2. Real-Time Viewer Count
     viewer_patterns = [
         r'(?:\\u0022|\\"|")num_viewers(?:\\u0022|\\"|")\s*:\s*(\d+)',
         r'(?:\\u0022|\\"|")viewers(?:\\u0022|\\"|")\s*:\s*(\d+)',
@@ -173,7 +191,7 @@ def parse_embed_html(username: str, html_text: str) -> dict:
             viewers = int(m.group(1))
             break
 
-    # 3. Extract Room Subject / Goal
+    # 3. Room Subject / Goal
     subject_patterns = [
         r'\\u0022(?:room_subject|subject|room_title|topic)\\u0022\s*:\s*\\u0022(.*?)\\u0022(?=\s*[,}\]])',
         r'\\"(?:room_subject|subject|room_title|topic)\\"\s*:\s*\\"(.*?)\\"(?=\s*[,}\]])',
@@ -186,18 +204,16 @@ def parse_embed_html(username: str, html_text: str) -> dict:
             extracted_subject = clean_subject_string(m.group(1))
             break
 
-    # Fallback to <title> if JS subject is blank
+    # Fallback to <title> if JS subject is missing
     if not extracted_subject:
         title_match = re.search(r'<title>(.*?)</title>', html_text, re.IGNORECASE | re.DOTALL)
         if title_match:
             t = title_match.group(1).strip()
-            # Strip standard suffix like ' - Chaturbate'
             t = re.sub(r'\s*-\s*Chaturbate.*$', '', t, flags=re.IGNORECASE)
             if t and t.lower() != username.lower():
                 extracted_subject = clean_subject_string(t)
 
     # 4. Map Normalized Status Hierarchy
-    # Public -> Private -> Others -> Offline
     if raw_status:
         if raw_status == "public":
             result["status"] = "public"
@@ -209,11 +225,9 @@ def parse_embed_html(username: str, html_text: str) -> dict:
             result["status"] = "offline"
             result["is_live"] = False
         else:
-            # group, hidden, club, away, password, ticket
             result["status"] = "others"
             result["is_live"] = True
     else:
-        # Fallback offline check
         if "room is offline" in html_text.lower() or "room_is_offline" in html_text.lower():
             result["status"] = "offline"
             result["is_live"] = False
@@ -277,7 +291,13 @@ def get_streamers_list(session: InfinityFreeSession) -> list:
     try:
         resp = session.get(STREAM_URL, params=params, timeout=12)
         if resp.status_code == 200:
-            data = resp.json()
+            try:
+                data = resp.json()
+            except json.JSONDecodeError:
+                print(f"[ERROR] Response is not JSON. Status: {resp.status_code}")
+                print(f"[DEBUG] Raw response: {resp.text[:300]}")
+                return []
+
             streamers = []
             if isinstance(data, list):
                 for item in data:
@@ -341,7 +361,6 @@ def main():
 
     print(f"[INFO] Loaded {len(streamers)} streamers. Starting 20-worker pool...")
 
-    # Embed scraper session with large connection pool
     embed_session = requests.Session()
     embed_adapter = HTTPAdapter(
         pool_connections=MAX_WORKERS + 5,
@@ -378,7 +397,6 @@ def main():
     print("-" * 65)
     print(f"[DONE] Scraped {len(results)} models in {elapsed}s. Detected {live_count} streamers LIVE!")
 
-    # Post state to database
     sync_resp = sync_results_to_backend(backend_session, results)
     print(f"[SYNC] Server Response: {sync_resp}")
     print("=" * 65)
