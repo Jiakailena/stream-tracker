@@ -15,7 +15,7 @@ TRACKER_KEY = "jitul_tracker_key_2026"
 TARGETS = ["mia_rom", "dellris"]
 
 print("=" * 65)
-print("🌍 FETCHING GLOBAL FEED VIA CLOUDFLARE WORKER (1 REQUEST)")
+print("🌍 FETCHING GLOBAL FEED VIA FIXED WORKER (1 REQUEST)")
 print("=" * 65)
 
 session = requests.Session()
@@ -27,8 +27,8 @@ try:
         headers={"x-tracker-key": TRACKER_KEY},
         timeout=30
     )
-    print(f"● Cloudflare Worker Status: {res.status_code}")
-    print(f"● Download Size: {len(res.content) / (1024 * 1024):.2f} MB")
+    print(f"● Worker HTTP Status : {res.status_code}")
+    print(f"● Received Payload   : {len(res.content)} bytes ({len(res.content) / (1024 * 1024):.2f} MB)")
 
     if res.status_code == 200:
         data = res.json()
@@ -38,7 +38,6 @@ try:
 
         if rooms:
             online_map = {r.get('username', '').lower(): r for r in rooms if 'username' in r}
-
             print("\n" + "=" * 65)
             print("🎯 TARGET MODELS TELEMETRY REPORT:")
             for t in TARGETS:
@@ -58,9 +57,9 @@ try:
                     print(f"⚫ {t.upper()} is OFFLINE")
             print("=" * 65)
     else:
-        print(f"❌ Failed: HTTP {res.status_code} -> {res.text[:250]}")
+        print(f"❌ Worker returned error response:\n{res.text}")
 
 except Exception as e:
-    print(f"❌ Error: {e}")
+    print(f"❌ Script Error: {e}")
 
 print("=" * 65)
