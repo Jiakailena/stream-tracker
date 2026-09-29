@@ -1,0 +1,20 @@
+name: Test Fetch Dump
+
+on:
+  workflow_dispatch: # Enables manual Run button in GitHub
+
+jobs:
+  run-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Run Fetch Test
+        run: python test_fetch.py
+        
