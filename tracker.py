@@ -4,10 +4,10 @@ import time
 import json
 import re
 import random
+import os
 import html as html_lib
-from pathlib import Path
 
-# Automatic curl_cffi installation check
+# Auto check for curl_cffi
 try:
     from curl_cffi import requests
 except ImportError:
@@ -15,31 +15,33 @@ except ImportError:
     from curl_cffi import requests
 
 # ==========================================
-# CONFIGURATION & SETTINGS
+# CONFIGURATION & CREDENTIALS
 # ==========================================
-WORKER_URL = "https://cb-feed-proxy.jiakailena.workers.dev"
-TRACKER_KEY = "jitul_tracker_key_2026"
-TARGET_FILE = "streamers.txt"   # 2000 targets listed one per line (optional)
+# Apnar InfinityFree website-er full URL ekhane boshie din:
+WEBSITE_URL = os.environ.get("WEBSITE_API_URL", "https://stacy.infinityfreeapp.com/stream.php")
 
-# Fallback targets if file is not found
-FALLBACK_TARGETS = ["mia_rom", "dellris", "_stayhere"]
+# Secret key matching TRACKER_SECRET_KEY in your index.php
+TRACKER_SECRET_KEY = os.environ.get("TRACKER_SYNC_KEY", "jitul_tracker_key_2026")
+
+# Cloudflare Worker URL
+WORKER_URL = "https://cb-feed-proxy.jiakailena.workers.dev"
+CLOUDFLARE_KEY = "jitul_tracker_key_2026"
 
 # ==========================================
 # HELPER FUNCTIONS
 # ==========================================
-def load_target_streamers() -> list:
-    """Loads up to 2000 target usernames into memory."""
-    target_path = Path(TARGET_FILE)
-    if target_path.exists():
-        with open(target_path, "r", encoding="utf-8") as f:
-            targets = [line.strip().lower() for line in f if line.strip() and not line.startswith("#")]
-        print(f"📋 Loaded {len(targets)} target streamers from {TARGET_FILE}")
-        return targets
-    print(f"⚠️ {TARGET_FILE} not found. Using fallback test targets.")
-    return [t.lower() for t in FALLBACK_TARGETS]
+def clean_model_name(raw: str) -> str:
+    """Standardizes username matching cleanName() in index.php"""
+    if not raw:
+        return ""
+    name = raw.strip()
+    name = re.sub(r'^https?://(?:www\.)?chaturbate\.com/', '', name, flags=re.I)
+    name = name.strip("/@ \t\n\r\0\x0B")
+    parts = name.split('/')[0].split('?')[0]
+    return parts.lower().strip()
 
 def clean_subject(raw: str) -> str:
-    """Decodes unicode, cleans html entities and removes extra whitespace."""
+    """Cleans unicode emojis and escaped characters"""
     if not raw:
         return ""
     try:
@@ -50,32 +52,44 @@ def clean_subject(raw: str) -> str:
     raw = raw.replace('\\"', '"').replace('\\/', '/')
     return re.sub(r'\s+', ' ', raw).strip()
 
-def extract_goal_tokens(text: str):
-    """Accurately extracts goal tokens left/remaining from room subject."""
-    if not text:
-        return None
-    # Pattern 1: [1070 tokens left] or [827 tokens remaining] or [500]
-    m1 = re.search(r'\[[^\d\]]*(\d+)[^\]]*\]', text)
-    if m1:
-        return int(m1.group(1))
-    
-    # Pattern 2: 500 tokens / 500 tk / 500 remaining
-    m2 = re.search(r'(\d+)\s*(?:tokens?|tk|remaining|left)\b', text, re.I)
-    if m2:
-        return int(m2.group(1))
-        
-    return None
+# ==========================================
+# 1. FETCH TARGETS DIRECTLY FROM WEBSITE DB
+# ==========================================
+def fetch_saved_streamers_from_website():
+    """Fetches all target streamers saved in your website database."""
+    print("🌐 Connecting to website to fetch saved streamer targets...")
+    session = requests.Session()
+    try:
+        res = session.post(
+            WEBSITE_URL,
+            data={"action": "load_all"},
+            timeout=25,
+            impersonate="chrome124"
+        )
+        if res.status_code == 200:
+            data = res.json()
+            if data.get("success"):
+                streamers = data.get("streamers", [])
+                targets = [clean_model_name(s.get("name", "")) for s in streamers if s.get("name")]
+                print(f"✅ Successfully loaded {len(targets)} saved streamers from website database!")
+                return targets
+            else:
+                print(f"⚠️ Website returned error: {res.text[:150]}")
+        else:
+            print(f"❌ Failed to reach website. HTTP {res.status_code}: {res.text[:150]}")
+    except Exception as e:
+        print(f"❌ Error fetching targets from website: {e}")
+
+    print("⚠️ Fallback to internal test targets.")
+    return ["mia_rom", "dellris", "_stayhere"]
 
 # ==========================================
-# CORE PAGINATION ENGINE (0.3s - 0.4s JITTER)
+# 2. FETCH CHATURBATE ROOMS (CLOUDFLARE PROXY)
 # ==========================================
 def fetch_all_live_rooms():
-    """
-    Fetches the full platform feed across batches with 0.3s-0.4s jitter.
-    Bypasses datacenter blocks via Cloudflare Worker.
-    """
+    """Fetches live room directory with 0.3s - 0.4s dynamic random jitter."""
     session = requests.Session()
-    headers = {"x-tracker-key": TRACKER_KEY}
+    headers = {"x-tracker-key": CLOUDFLARE_KEY}
     
     all_rooms = []
     offset = 0
@@ -83,15 +97,14 @@ def fetch_all_live_rooms():
     page_num = 1
     start_time = time.time()
 
-    print("🚀 Starting ultra-safe paginated fetch from Cloudflare Worker...")
+    print("\n🚀 Fetching global live rooms via Cloudflare Worker...")
 
     while True:
         url = f"{WORKER_URL}?offset={offset}"
         try:
             res = session.get(url, headers=headers, timeout=20)
-            
             if res.status_code != 200:
-                print(f"❌ Batch {page_num} failed with status {res.status_code}. Details: {res.text[:120]}")
+                print(f"⚠️ Batch {page_num} stopped (HTTP {res.status_code}).")
                 break
 
             data = res.json()
@@ -99,129 +112,132 @@ def fetch_all_live_rooms():
             total_count = data.get('count', 0) if isinstance(data, dict) else len(rooms)
 
             if not rooms:
-                print("ℹ️ No more rooms returned. Finished pagination.")
                 break
 
             all_rooms.extend(rooms)
             print(f"  ● Batch {page_num} (Offset {offset}): +{len(rooms)} rooms | Total: {len(all_rooms)} / {total_count}")
 
-            # Stop conditions
             if len(all_rooms) >= total_count or len(rooms) < batch_size:
                 break
 
             offset += batch_size
             page_num += 1
 
-            # DYNAMIC RANDOM JITTER: 0.3s to 0.4s safe micro-pause
-            jitter_delay = round(random.uniform(0.30, 0.40), 3)
-            time.sleep(jitter_delay)
+            # Dynamic Random Jitter (0.30s to 0.40s)
+            time.sleep(round(random.uniform(0.30, 0.40), 3))
 
         except Exception as e:
-            print(f"❌ Exception in batch {page_num}: {e}")
+            print(f"❌ Error in batch {page_num}: {e}")
             break
 
     elapsed = round(time.time() - start_time, 2)
-    print(f"✅ Download completed! {len(all_rooms)} live rooms collected in {elapsed}s.\n")
+    print(f"✅ Collected {len(all_rooms)} live rooms in {elapsed}s.")
     return all_rooms
 
 # ==========================================
-# MAIN EXECUTION
+# 3. POST TELEMETRY BACK TO WEBSITE
+# ==========================================
+def sync_payload_to_website(payload):
+    """Sends matched status telemetry to website sync_tracker endpoint."""
+    print(f"\n📡 Syncing telemetry for {len(payload)} streamers to website database...")
+    session = requests.Session()
+    
+    post_data = {
+        "action": "sync_tracker",
+        "secret": TRACKER_SECRET_KEY,
+        "payload": json.dumps(payload, ensure_ascii=False)
+    }
+
+    try:
+        res = session.post(
+            WEBSITE_URL,
+            data=post_data,
+            timeout=30,
+            impersonate="chrome124"
+        )
+        if res.status_code == 200:
+            try:
+                ret = res.json()
+                if ret.get("success"):
+                    print(f"🎉 WEBSITE SYNC SUCCESS! Updated: {ret.get('updated', len(payload))} streamers.")
+                    return True
+                else:
+                    print(f"❌ Website rejected sync: {ret.get('message')}")
+            except Exception:
+                print(f"⚠️ Website returned non-JSON response:\n{res.text[:300]}")
+        else:
+            print(f"❌ HTTP Error {res.status_code} during sync:\n{res.text[:300]}")
+    except Exception as e:
+        print(f"❌ Connection error while syncing to website: {e}")
+
+    return False
+
+# ==========================================
+# MAIN ROUTINE
 # ==========================================
 def main():
     print("=" * 70)
-    print("🎯 CHATURBATE HIGH-SPEED AFFILIATE TELEMETRY TRACKER")
+    print("🎯 LIVE LOUNGE AUTO-SYNC TRACKER ENGINE")
     print("=" * 70)
 
-    target_list = load_target_streamers()
-    global_rooms = fetch_all_live_rooms()
-
-    if not global_rooms:
-        print("❌ Empty room feed received. Exiting.")
+    # Step 1: Target Streamers from Website
+    target_list = fetch_saved_streamers_from_website()
+    if not target_list:
+        print("❌ No target streamers found. Exiting.")
         return
 
-    # In-memory dictionary hashmap (Lookup in O(1) ~ 0.002 seconds)
-    print("⚡ Building fast in-memory user map...")
-    online_map = {r.get('username', '').lower(): r for r in global_rooms if 'username' in r}
+    # Step 2: Global Live Rooms from Cloudflare
+    global_rooms = fetch_all_live_rooms()
 
-    matched_results = []
+    # Step 3: Fast In-Memory Map
+    print("\n⚡ Matching targets against live platform data...")
+    online_map = {clean_model_name(r.get('username', '')): r for r in global_rooms if r.get('username')}
+
+    payload_for_website = []
     live_count = 0
 
     for target in target_list:
-        target_clean = target.lower()
-        
-        if target_clean in online_map:
-            room = online_map[target_clean]
-            raw_show = room.get('current_show', 'public').lower()
-            
-            # Map platform status to standardized states
+        target_name = clean_model_name(target)
+        if target_name in online_map:
+            room = online_map[target_name]
+            raw_show = str(room.get('current_show', 'public')).lower()
+
+            # Align status with index.php & app.js: 'public', 'private', 'others'
             if raw_show in ['private', 'ticket_show', 'vip']:
                 status = 'private'
             elif raw_show in ['away', 'hidden', 'group_show', 'club_show']:
-                status = 'away'
+                status = 'others'
             else:
                 status = 'public'
 
             subj = clean_subject(room.get('room_subject', ''))
-            tokens = extract_goal_tokens(subj)
             viewers = int(room.get('num_users', 0))
-            duration_mins = int(room.get('seconds_online', 0)) // 60
-            followers = int(room.get('num_followers', 0))
 
-            telemetry = {
-                "username": target,
+            payload_for_website.append({
+                "name": target_name,
                 "status": status,
-                "raw_status": raw_show,
                 "viewers": viewers,
-                "tokens": tokens,
-                "subject": subj,
-                "online_mins": duration_mins,
-                "followers": followers,
-                "is_hd": room.get('is_hd', False),
-                "is_new": room.get('is_new', False),
-                "image_preview": room.get('image_url_360x270', '')
-            }
+                "subject": subj
+            })
             live_count += 1
         else:
-            telemetry = {
-                "username": target,
+            payload_for_website.append({
+                "name": target_name,
                 "status": "offline",
-                "raw_status": "offline",
                 "viewers": 0,
-                "tokens": None,
-                "subject": "",
-                "online_mins": 0,
-                "followers": 0,
-                "is_hd": False,
-                "is_new": False,
-                "image_preview": ""
-            }
+                "subject": ""
+            })
 
-        matched_results.append(telemetry)
+    # Step 4: Push to Website Database
+    sync_payload_to_website(payload_for_website)
 
-    # Save output to telemetry json
-    output_file = Path("telemetry_snapshot.json")
-    with open(output_file, "w", encoding="utf-8") as f:
-        json.dump(matched_results, f, indent=2, ensure_ascii=False)
-
+    # Step 5: Terminal Summary
     print("=" * 70)
-    print(f"📊 SUMMARY REPORT:")
+    print(f"📊 SUMMARY:")
     print(f"● Total Target Streamers : {len(target_list)}")
     print(f"● Currently Online       : {live_count}")
     print(f"● Currently Offline      : {len(target_list) - live_count}")
-    print(f"● Telemetry exported to  : {output_file.resolve()}")
     print("=" * 70)
-
-    # Preview sample matched targets
-    print("\n🔍 LIVE TARGET PREVIEWS:")
-    for res in matched_results:
-        if res['status'] != 'offline':
-            st_color = "🟢" if res['status'] == 'public' else ("🔒" if res['status'] == 'private' else "🟡")
-            print(f"{st_color} {res['username'].upper()} | Status: {res['status'].upper()} | Viewers: {res['viewers']} | Online: {res['online_mins']}m")
-            if res['tokens'] is not None:
-                print(f"   🎯 Tokens Left: {res['tokens']}")
-            if res['subject']:
-                print(f"   📝 Subject: {res['subject'][:70]}...")
-            print("-" * 50)
 
 if __name__ == "__main__":
     main()
