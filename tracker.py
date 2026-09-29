@@ -4,7 +4,6 @@ import time
 import json
 import re
 import random
-import os
 import html as html_lib
 
 # Auto check for curl_cffi
@@ -15,15 +14,11 @@ except ImportError:
     from curl_cffi import requests
 
 # ==========================================
-# CONFIGURATION & CREDENTIALS
+# CONFIGURATION & SETTINGS
 # ==========================================
-# Apnar InfinityFree website-er full URL ekhane boshie din:
-WEBSITE_URL = os.environ.get("WEBSITE_API_URL", "https://stacy.infinityfreeapp.com/stream.php")
+WEBSITE_URL = "https://stacy.infinityfreeapp.com/stream.php"
+TRACKER_SECRET_KEY = "jitul_tracker_key_2026"
 
-# Secret key matching TRACKER_SECRET_KEY in your index.php
-TRACKER_SECRET_KEY = os.environ.get("TRACKER_SYNC_KEY", "jitul_tracker_key_2026")
-
-# Cloudflare Worker URL
 WORKER_URL = "https://cb-feed-proxy.jiakailena.workers.dev"
 CLOUDFLARE_KEY = "jitul_tracker_key_2026"
 
@@ -31,10 +26,10 @@ CLOUDFLARE_KEY = "jitul_tracker_key_2026"
 # HELPER FUNCTIONS
 # ==========================================
 def clean_model_name(raw: str) -> str:
-    """Standardizes username matching cleanName() in index.php"""
+    """Standardizes username matching cleanName() in stream.php"""
     if not raw:
         return ""
-    name = raw.strip()
+    name = str(raw).strip()
     name = re.sub(r'^https?://(?:www\.)?chaturbate\.com/', '', name, flags=re.I)
     name = name.strip("/@ \t\n\r\0\x0B")
     parts = name.split('/')[0].split('?')[0]
@@ -61,7 +56,7 @@ def fetch_saved_streamers_from_website():
     session = requests.Session()
     try:
         res = session.post(
-            WEBSITE_URL,
+            WEBSITE_URL.strip(),
             data={"action": "load_all"},
             timeout=25,
             impersonate="chrome124"
@@ -104,7 +99,7 @@ def fetch_all_live_rooms():
         try:
             res = session.get(url, headers=headers, timeout=20)
             if res.status_code != 200:
-                print(f"⚠️ Batch {page_num} stopped (HTTP {res.status_code}).")
+                print(f"⚠️️ Batch {page_num} stopped (HTTP {res.status_code}).")
                 break
 
             data = res.json()
@@ -150,7 +145,7 @@ def sync_payload_to_website(payload):
 
     try:
         res = session.post(
-            WEBSITE_URL,
+            WEBSITE_URL.strip(),
             data=post_data,
             timeout=30,
             impersonate="chrome124"
@@ -202,7 +197,7 @@ def main():
             room = online_map[target_name]
             raw_show = str(room.get('current_show', 'public')).lower()
 
-            # Align status with index.php & app.js: 'public', 'private', 'others'
+            # Align status with stream.php & app.js: 'public', 'private', 'others'
             if raw_show in ['private', 'ticket_show', 'vip']:
                 status = 'private'
             elif raw_show in ['away', 'hidden', 'group_show', 'club_show']:
