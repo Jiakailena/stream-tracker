@@ -10,78 +10,57 @@ except ImportError:
     subprocess.check_call([sys.executable, "-m", "pip", "install", "curl_cffi"])
     from curl_cffi import requests
 
+WORKER_URL = "https://cb-feed-proxy.jiakailena.workers.dev"
+TRACKER_KEY = "jitul_tracker_key_2026"
 TARGETS = ["mia_rom", "dellris"]
+
+print("=" * 65)
+print("🌍 FETCHING GLOBAL FEED VIA CLOUDFLARE WORKER (1 REQUEST)")
+print("=" * 65)
+
 session = requests.Session()
+start_t = time.time()
 
-print("=" * 65)
-print("🌍 TESTING CHATURBATE GLOBAL FEED ALTERNATIVE ENDPOINTS")
-print("=" * 65)
+try:
+    res = session.get(
+        WORKER_URL,
+        headers={"x-tracker-key": TRACKER_KEY},
+        timeout=30
+    )
+    print(f"● Cloudflare Worker Status: {res.status_code}")
+    print(f"● Download Size: {len(res.content) / (1024 * 1024):.2f} MB")
 
-# Endpoints that provide the global rooms in 1 single request
-CANDIDATE_URLS = [
-    # 1. Main affiliate feed with json format
-    "https://chaturbate.com/affiliates/api/onlinerooms/?format=json",
-    # 2. Public API without wm restrictions
-    "https://chaturbate.com/api/public/affiliates/onlinerooms/?format=json&limit=100&client_ip=1.1.1.1&wm=9cPAZ",
-    # 3. Direct frontpage catalog API
-    "https://chaturbate.com/api/ts/roomlist/room-list/?limit=90"
-]
+    if res.status_code == 200:
+        data = res.json()
+        rooms = data if isinstance(data, list) else (data.get('results') or data.get('rooms') or [])
+        elapsed = round(time.time() - start_t, 2)
+        print(f"✅ SUCCESS! Fetched {len(rooms)} live rooms in {elapsed}s")
 
-all_rooms = []
+        if rooms:
+            online_map = {r.get('username', '').lower(): r for r in rooms if 'username' in r}
 
-for idx, url in enumerate(CANDIDATE_URLS, 1):
-    print(f"\n[TRY {idx}] Connecting to: {url[:60]}...")
-    try:
-        start_t = time.time()
-        res = session.get(
-            url, 
-            impersonate="chrome124", 
-            timeout=20,
-            headers={
-                'Accept': 'application/json, text/plain, */*',
-                'Referer': 'https://chaturbate.com/'
-            }
-        )
-        print(f"● Status: {res.status_code} | Size: {len(res.content)} bytes")
+            print("\n" + "=" * 65)
+            print("🎯 TARGET MODELS TELEMETRY REPORT:")
+            for t in TARGETS:
+                if t.lower() in online_map:
+                    m = online_map[t.lower()]
+                    subj = m.get('room_subject', '').strip()
+                    tokens_m = re.search(r'\[[^\d\]]*(\d+)[^\]]*\]', subj) or re.search(r'(\d+)\s*(?:tokens?|tk)\b', subj, re.I)
+                    tokens = tokens_m.group(1) if tokens_m else "None"
 
-        if res.status_code == 200:
-            try:
-                data = res.json()
-                rooms = []
-                if isinstance(data, list):
-                    rooms = data
-                elif isinstance(data, dict):
-                    rooms = data.get('results') or data.get('rooms') or data.get('data') or []
-                
-                if len(rooms) > 0:
-                    print(f"✅ SUCCESS! Fetched {len(rooms)} live rooms in {round(time.time() - start_t, 2)}s!")
-                    all_rooms = rooms
-                    break
+                    print(f"🟢 {t.upper()} is LIVE!")
+                    print(f"   ● Status   : {m.get('current_show', 'public').upper()}")
+                    print(f"   ● Viewers  : {m.get('num_users', 0)} viewers")
+                    print(f"   ● Duration : {m.get('seconds_online', 0) // 60} mins online")
+                    print(f"   ● Goal/Subj: {subj}")
+                    print(f"   ● Tokens   : {tokens}")
                 else:
-                    print("⚠️ Returned 200 OK but 0 rooms found.")
-            except Exception as parse_err:
-                print(f"⚠️ JSON parsing error: {parse_err}")
-        else:
-            print(f"❌ Failed: HTTP {res.status_code}")
-    except Exception as e:
-        print(f"❌ Connection error: {e}")
+                    print(f"⚫ {t.upper()} is OFFLINE")
+            print("=" * 65)
+    else:
+        print(f"❌ Failed: HTTP {res.status_code} -> {res.text[:250]}")
 
-# Target check if any endpoint succeeded
-if all_rooms:
-    print("\n" + "=" * 65)
-    print("🎯 CHECKING TARGET STREAMERS IN DOWNLOADED LIST:")
-    online_map = {r.get('username', '').lower(): r for r in all_rooms if 'username' in r}
-    
-    for t in TARGETS:
-        if t.lower() in online_map:
-            m = online_map[t.lower()]
-            print(f"🟢 {t.upper()} is LIVE! Viewers: {m.get('num_users', m.get('viewers', 0))} | Show: {m.get('current_show', 'public')}")
-        else:
-            print(f"⚫ {t.upper()} is not in this live batch.")
-    
-    sample = all_rooms[0]
-    print(f"\n[Sample Room Data]: Name: {sample.get('username')} | Viewers: {sample.get('num_users', sample.get('viewers'))}")
-else:
-    print("\n⚠️ None of the global endpoints returned rooms on this datacenter IP.")
+except Exception as e:
+    print(f"❌ Error: {e}")
 
 print("=" * 65)
