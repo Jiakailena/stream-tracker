@@ -1,74 +1,45 @@
-#!/usr/bin/env python3
-"""
-Live Lounge - Stream Tracker (tracker.py)
-------------------------------------------
-- 20-Worker concurrent embed scraper (chaturbate.com/embed/{username}/?bgcolor=black)
-- Extracts live status, `num_viewers`, and `room_subject` in a single pass
-- InfinityFree slowAES firewall bypass
-- Direct sync back to stream.php (load_all -> sync_tracker)
-"""
-
-import os
-import re
 import sys
+import subprocess
 import time
 import json
+import re
+import random
 import html as html_lib
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util import Retry
-from concurrent.futures import ThreadPoolExecutor
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-from cryptography.hazmat.backends import default_backend
+from pathlib import Path
 
-ENDPOINT_URL = "https://stacy.infinityfreeapp.com/stream.php"
-TRACKER_SECRET = "jitul_tracker_key_2026"
+# Automatic curl_cffi installation check
+try:
+    from curl_cffi import requests
+except ImportError:
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "curl_cffi"])
+    from curl_cffi import requests
 
-session = requests.Session()
-adapter = HTTPAdapter(
-    pool_connections=35,
-    pool_maxsize=35,
-    max_retries=Retry(total=1, backoff_factor=0.2)
-)
-session.mount('https://', adapter)
-session.mount('http://', adapter)
+# ==========================================
+# CONFIGURATION & SETTINGS
+# ==========================================
+WORKER_URL = "https://cb-feed-proxy.jiakailena.workers.dev"
+TRACKER_KEY = "jitul_tracker_key_2026"
+TARGET_FILE = "streamers.txt"   # 2000 targets listed one per line (optional)
 
-session.headers.update({
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,application/json,*/*;q=0.8',
-    'Accept-Language': 'en-US,en;q=0.9'
-})
+# Fallback targets if file is not found
+FALLBACK_TARGETS = ["mia_rom", "dellris", "_stayhere"]
 
-
-def bypass_infinityfree(url):
-    """Bypasses InfinityFree's slowAES __test cookie challenge automatically"""
-    try:
-        res = session.get(url, timeout=12)
-        if 'slowAES.decrypt' in res.text:
-            matches = re.findall(r'toNumbers\("([0-9a-fA-F]+)"\)', res.text)
-            if len(matches) >= 3:
-                a_key = bytes.fromhex(matches[0])
-                b_iv = bytes.fromhex(matches[1])
-                c_cipher = bytes.fromhex(matches[2])
-
-                cipher = Cipher(algorithms.AES(a_key), modes.CBC(b_iv), backend=default_backend())
-                decryptor = cipher.decryptor()
-                cookie_val = (decryptor.update(c_cipher) + decryptor.finalize()).hex()
-
-                # Set on both subdomain, wildcard domain, and header for 100% persistence
-                session.cookies.set('__test', cookie_val, domain='stacy.infinityfreeapp.com', path='/')
-                session.cookies.set('__test', cookie_val, domain='.infinityfreeapp.com', path='/')
-                session.headers['Cookie'] = f'__test={cookie_val}'
-                print("[OK] InfinityFree firewall bypassed successfully!")
-                return True
-        return True
-    except Exception as e:
-        print(f"[ERROR] Bypass error: {e}")
-        return False
-
+# ==========================================
+# HELPER FUNCTIONS
+# ==========================================
+def load_target_streamers() -> list:
+    """Loads up to 2000 target usernames into memory."""
+    target_path = Path(TARGET_FILE)
+    if target_path.exists():
+        with open(target_path, "r", encoding="utf-8") as f:
+            targets = [line.strip().lower() for line in f if line.strip() and not line.startswith("#")]
+        print(f"📋 Loaded {len(targets)} target streamers from {TARGET_FILE}")
+        return targets
+    print(f"⚠️ {TARGET_FILE} not found. Using fallback test targets.")
+    return [t.lower() for t in FALLBACK_TARGETS]
 
 def clean_subject(raw: str) -> str:
-    """Decodes unicode escapes (\\u2665, \\u0020), HTML entities, and formatting."""
+    """Decodes unicode, cleans html entities and removes extra whitespace."""
     if not raw:
         return ""
     try:
@@ -79,162 +50,179 @@ def clean_subject(raw: str) -> str:
     raw = raw.replace('\\"', '"').replace('\\/', '/')
     return re.sub(r'\s+', ' ', raw).strip()
 
-
-def extract_from_embed_html(html_text: str):
-    """
-    Extracts real-time viewer count and room subject from embed HTML.
-    Supports raw quotes, escaped quotes (\\"), and unicode escaped quotes (\\u0022).
-    """
-    viewers = 0
-    subject = ''
-
-    if not html_text:
-        return viewers, subject
-
-    # 1. Real-time Viewers (Chaturbate uses num_viewers inside embed JS)
-    mv = re.search(r'(?:\\u0022|\\"|")num_viewers(?:\\u0022|\\"|")\s*:\s*(\d+)', html_text) or \
-         re.search(r'(?:\\u0022|\\"|")viewers(?:\\u0022|\\"|")\s*:\s*(\d+)', html_text) or \
-         re.search(r'(?:\\u0022|\\"|")num_users(?:\\u0022|\\"|")\s*:\s*(\d+)', html_text)
-    if mv:
-        viewers = int(mv.group(1))
-
-    # 2. Room Subject / Goal
-    ms = re.search(r'(?:\\u0022|\\"|")room_subject(?:\\u0022|\\"|")\s*:\s*(?:\\u0022|\\"|")(.*?)(?:\\u0022|\\"|")(?=\s*[,}\]])', html_text, re.DOTALL) or \
-         re.search(r'(?:\\u0022|\\"|")subject(?:\\u0022|\\"|")\s*:\s*(?:\\u0022|\\"|")(.*?)(?:\\u0022|\\"|")(?=\s*[,}\]])', html_text, re.DOTALL) or \
-         re.search(r'(?:\\u0022|\\"|")room_title(?:\\u0022|\\"|")\s*:\s*(?:\\u0022|\\"|")(.*?)(?:\\u0022|\\"|")(?=\s*[,}\]])', html_text, re.DOTALL)
-    if ms:
-        subject = clean_subject(ms.group(1))
-
-    # Fallback to <title> if JS subject tag is not found
-    if not subject:
-        title_match = re.search(r'<title>(.*?)</title>', html_text, re.IGNORECASE | re.DOTALL)
-        if title_match:
-            t = title_match.group(1).strip()
-            t = re.sub(r'\s*-\s*Chaturbate.*$', '', t, flags=re.IGNORECASE)
-            subject = clean_subject(t)
-
-    return viewers, subject
-
-
-def check_live_status_embed(username: str):
-    """
-    Fast, reliable 20-worker live status detector via embed URL.
-    Extracts status, viewers, and subject in a single request.
-    """
-    url = f"https://chaturbate.com/embed/{username}/?bgcolor=black"
-    try:
-        res = session.get(url, timeout=7)
-        if res.status_code == 200:
-            html_text = res.text
-
-            # Check Room Status (Matches \u0022room_status\u0022: \u0022public\u0022)
-            status_match = re.search(
-                r'(?:\\u0022|\\"|")room_status(?:\\u0022|\\"|")\s*:\s*(?:\\u0022|\\"|")([a-zA-Z0-9_\-]+)(?:\\u0022|\\"|")',
-                html_text
-            )
-
-            status = None
-            if status_match:
-                raw_status = status_match.group(1).lower()
-                if raw_status in ['offline', 'disabled', 'away_offline']:
-                    return None
-                elif raw_status in ['private', 'ticket_show', 'vip', 'c2c']:
-                    status = 'private'
-                elif raw_status in ['away', 'hidden', 'group_show', 'club_show']:
-                    status = 'others'
-                else:
-                    status = 'public'
-            elif '.m3u8' in html_text or '"is_live": true' in html_text or '\\u0022is_live\\u0022: true' in html_text:
-                status = 'public'
-            else:
-                return None
-
-            # Extract Viewers & Subject directly from the same HTML
-            viewers, subject = extract_from_embed_html(html_text)
-
-            return {
-                'name': username,
-                'status': status,
-                'viewers': viewers,
-                'subject': subject
-            }
-    except Exception:
-        pass
-
+def extract_goal_tokens(text: str):
+    """Accurately extracts goal tokens left/remaining from room subject."""
+    if not text:
+        return None
+    # Pattern 1: [1070 tokens left] or [827 tokens remaining] or [500]
+    m1 = re.search(r'\[[^\d\]]*(\d+)[^\]]*\]', text)
+    if m1:
+        return int(m1.group(1))
+    
+    # Pattern 2: 500 tokens / 500 tk / 500 remaining
+    m2 = re.search(r'(\d+)\s*(?:tokens?|tk|remaining|left)\b', text, re.I)
+    if m2:
+        return int(m2.group(1))
+        
     return None
 
+# ==========================================
+# CORE PAGINATION ENGINE (0.3s - 0.4s JITTER)
+# ==========================================
+def fetch_all_live_rooms():
+    """
+    Fetches the full platform feed across batches with 0.3s-0.4s jitter.
+    Bypasses datacenter blocks via Cloudflare Worker.
+    """
+    session = requests.Session()
+    headers = {"x-tracker-key": TRACKER_KEY}
+    
+    all_rooms = []
+    offset = 0
+    batch_size = 500
+    page_num = 1
+    start_time = time.time()
 
+    print("🚀 Starting ultra-safe paginated fetch from Cloudflare Worker...")
+
+    while True:
+        url = f"{WORKER_URL}?offset={offset}"
+        try:
+            res = session.get(url, headers=headers, timeout=20)
+            
+            if res.status_code != 200:
+                print(f"❌ Batch {page_num} failed with status {res.status_code}. Details: {res.text[:120]}")
+                break
+
+            data = res.json()
+            rooms = data.get('results', []) if isinstance(data, dict) else []
+            total_count = data.get('count', 0) if isinstance(data, dict) else len(rooms)
+
+            if not rooms:
+                print("ℹ️ No more rooms returned. Finished pagination.")
+                break
+
+            all_rooms.extend(rooms)
+            print(f"  ● Batch {page_num} (Offset {offset}): +{len(rooms)} rooms | Total: {len(all_rooms)} / {total_count}")
+
+            # Stop conditions
+            if len(all_rooms) >= total_count or len(rooms) < batch_size:
+                break
+
+            offset += batch_size
+            page_num += 1
+
+            # DYNAMIC RANDOM JITTER: 0.3s to 0.4s safe micro-pause
+            jitter_delay = round(random.uniform(0.30, 0.40), 3)
+            time.sleep(jitter_delay)
+
+        except Exception as e:
+            print(f"❌ Exception in batch {page_num}: {e}")
+            break
+
+    elapsed = round(time.time() - start_time, 2)
+    print(f"✅ Download completed! {len(all_rooms)} live rooms collected in {elapsed}s.\n")
+    return all_rooms
+
+# ==========================================
+# MAIN EXECUTION
+# ==========================================
 def main():
-    print("=" * 65)
-    print(" LIVE LOUNGE TRACKER - DIRECT EMBED PARSER")
-    print("=" * 65)
+    print("=" * 70)
+    print("🎯 CHATURBATE HIGH-SPEED AFFILIATE TELEMETRY TRACKER")
+    print("=" * 70)
 
-    # 1. InfinityFree Firewall Bypass
-    bypass_infinityfree(ENDPOINT_URL)
+    target_list = load_target_streamers()
+    global_rooms = fetch_all_live_rooms()
 
-    # 2. Load streamers from database
-    try:
-        res = session.post(ENDPOINT_URL, data={'action': 'load_all'}, timeout=15)
-        site_data = res.json()
-        raw_streamers = site_data.get('streamers', [])
-    except Exception as e:
-        print(f"[ERROR] Failed to load streamers: {e}")
+    if not global_rooms:
+        print("❌ Empty room feed received. Exiting.")
         return
 
-    if not raw_streamers:
-        print("[WARN] No saved streamers found in library.")
-        return
+    # In-memory dictionary hashmap (Lookup in O(1) ~ 0.002 seconds)
+    print("⚡ Building fast in-memory user map...")
+    online_map = {r.get('username', '').lower(): r for r in global_rooms if 'username' in r}
 
-    saved_set = [s['name'].lower() for s in raw_streamers if 'name' in s]
-    print(f"[INFO] Total streamers in library: {len(saved_set)}")
+    matched_results = []
+    live_count = 0
 
-    # 3. High-Speed 20-Workers Concurrency Live Verification & Detail Extraction
-    print(f"[INFO] Verifying live status, viewers, and subjects with 20 parallel workers...")
-    confirmed_live = []
-    found_online = set()
+    for target in target_list:
+        target_clean = target.lower()
+        
+        if target_clean in online_map:
+            room = online_map[target_clean]
+            raw_show = room.get('current_show', 'public').lower()
+            
+            # Map platform status to standardized states
+            if raw_show in ['private', 'ticket_show', 'vip']:
+                status = 'private'
+            elif raw_show in ['away', 'hidden', 'group_show', 'club_show']:
+                status = 'away'
+            else:
+                status = 'public'
 
-    with ThreadPoolExecutor(max_workers=20) as executor:
-        results = executor.map(check_live_status_embed, saved_set)
-        for r in results:
-            if r:
-                confirmed_live.append(r)
-                found_online.add(r['name'])
+            subj = clean_subject(room.get('room_subject', ''))
+            tokens = extract_goal_tokens(subj)
+            viewers = int(room.get('num_users', 0))
+            duration_mins = int(room.get('seconds_online', 0)) // 60
+            followers = int(room.get('num_followers', 0))
 
-    print(f"[OK] Detected {len(confirmed_live)} streamers LIVE!")
+            telemetry = {
+                "username": target,
+                "status": status,
+                "raw_status": raw_show,
+                "viewers": viewers,
+                "tokens": tokens,
+                "subject": subj,
+                "online_mins": duration_mins,
+                "followers": followers,
+                "is_hd": room.get('is_hd', False),
+                "is_new": room.get('is_new', False),
+                "image_preview": room.get('image_url_360x270', '')
+            }
+            live_count += 1
+        else:
+            telemetry = {
+                "username": target,
+                "status": "offline",
+                "raw_status": "offline",
+                "viewers": 0,
+                "tokens": None,
+                "subject": "",
+                "online_mins": 0,
+                "followers": 0,
+                "is_hd": False,
+                "is_new": False,
+                "image_preview": ""
+            }
 
-    # 4. Handle Offline streamers
-    status_payload = list(confirmed_live)
-    for name in set(saved_set) - found_online:
-        status_payload.append({
-            'name': name,
-            'status': 'offline',
-            'viewers': 0,
-            'subject': ''
-        })
+        matched_results.append(telemetry)
 
-    # Summary Report in Actions Log
-    print("\n--- FINAL LIVE STATUS REPORT ---")
-    for item in status_payload:
-        if item['status'] != 'offline':
-            subj = item['subject']
-            preview = (subj[:45] + "...") if len(subj) > 45 else subj
-            print(f"-> [{item['name'].upper():<16}] Status: {item['status']:<7} | Viewers: {item['viewers']:<5} | Subject: '{preview}'")
-    print(f"\nSummary: {len(confirmed_live)} LIVE, {len(saved_set) - len(confirmed_live)} OFFLINE.\n")
+    # Save output to telemetry json
+    output_file = Path("telemetry_snapshot.json")
+    with open(output_file, "w", encoding="utf-8") as f:
+        json.dump(matched_results, f, indent=2, ensure_ascii=False)
 
-    # 5. Push to Database
-    print("[INFO] Syncing verified stats to database...")
-    try:
-        sync_res = session.post(ENDPOINT_URL, data={
-            'action': 'sync_tracker',
-            'secret': TRACKER_SECRET,
-            'payload': json.dumps(status_payload)
-        }, timeout=20)
-        print("[SYNC] Database Sync Result:", sync_res.json())
-    except Exception as e:
-        print(f"[ERROR] Sync error: {e}")
+    print("=" * 70)
+    print(f"📊 SUMMARY REPORT:")
+    print(f"● Total Target Streamers : {len(target_list)}")
+    print(f"● Currently Online       : {live_count}")
+    print(f"● Currently Offline      : {len(target_list) - live_count}")
+    print(f"● Telemetry exported to  : {output_file.resolve()}")
+    print("=" * 70)
 
-    print("=" * 65)
+    # Preview sample matched targets
+    print("\n🔍 LIVE TARGET PREVIEWS:")
+    for res in matched_results:
+        if res['status'] != 'offline':
+            st_color = "🟢" if res['status'] == 'public' else ("🔒" if res['status'] == 'private' else "🟡")
+            print(f"{st_color} {res['username'].upper()} | Status: {res['status'].upper()} | Viewers: {res['viewers']} | Online: {res['online_mins']}m")
+            if res['tokens'] is not None:
+                print(f"   🎯 Tokens Left: {res['tokens']}")
+            if res['subject']:
+                print(f"   📝 Subject: {res['subject'][:70]}...")
+            print("-" * 50)
 
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
+    
