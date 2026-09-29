@@ -4,14 +4,20 @@ import time
 import json
 import re
 import random
+import os
 import html as html_lib
+from urllib.parse import urlparse
 
-# Auto check for curl_cffi
-try:
-    from curl_cffi import requests
-except ImportError:
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "curl_cffi"])
-    from curl_cffi import requests
+# Auto check for curl_cffi and cryptography
+for pkg in ["curl_cffi", "cryptography"]:
+    try:
+        __import__(pkg)
+    except ImportError:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
+
+from curl_cffi import requests
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.backends import default_backend
 
 # ==========================================
 # CONFIGURATION & SETTINGS
@@ -48,15 +54,63 @@ def clean_subject(raw: str) -> str:
     return re.sub(r'\s+', ' ', raw).strip()
 
 # ==========================================
+# INFINITYFREE BYETHOST AES CHALLENGE SOLVER
+# ==========================================
+def bypass_infinityfree_firewall(session, target_url: str):
+    """
+    Solves InfinityFree / ByetHost aes.js challenge and injects __test cookie.
+    Guarantees subsequent GET/POST requests pass straight to stream.php.
+    """
+    print("🛡️ Checking InfinityFree bot security challenge...")
+    try:
+        res = session.get(target_url, impersonate="chrome124", timeout=20)
+        html = res.text
+
+        if "aes.js" in html or "toNumbers" in html:
+            ma = re.search(r'a\s*=\s*toNumbers\(["\']([0-9a-fA-F]+)["\']\)', html)
+            mb = re.search(r'b\s*=\s*toNumbers\(["\']([0-9a-fA-F]+)["\']\)', html)
+            mc = re.search(r'c\s*=\s*toNumbers\(["\']([0-9a-fA-F]+)["\']\)', html)
+
+            if ma and mb and mc:
+                key = bytes.fromhex(ma.group(1))
+                iv = bytes.fromhex(mb.group(1))
+                ct = bytes.fromhex(mc.group(1))
+
+                cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())
+                dec = cipher.decryptor()
+                cookie_val = (dec.update(ct) + dec.finalize()).hex()
+
+                # Attach cookie to session headers and cookie jar
+                session.headers["Cookie"] = f"__test={cookie_val}"
+                try:
+                    domain = urlparse(target_url).netloc
+                    session.cookies.set("__test", cookie_val, domain=domain)
+                except Exception:
+                    pass
+
+                print(f"🔓 Solved InfinityFree Challenge! (__test={cookie_val[:8]}...)")
+
+                # Clearance verification knock
+                verify_res = session.get(target_url, impersonate="chrome124", timeout=20)
+                if "aes.js" not in verify_res.text:
+                    print("✅ Security cleared! Server is ready to process requests.")
+                return True
+        else:
+            print("✅ Direct connection open (No security challenge triggered).")
+            return True
+    except Exception as e:
+        print(f"⚠️ Firewall check exception: {e}")
+    return False
+
+# ==========================================
 # 1. FETCH TARGETS DIRECTLY FROM WEBSITE DB
 # ==========================================
-def fetch_saved_streamers_from_website():
+def fetch_saved_streamers_from_website(session):
     """Fetches all target streamers saved in your website database."""
     print("🌐 Connecting to website to fetch saved streamer targets...")
-    session = requests.Session()
     try:
         res = session.post(
-            WEBSITE_URL.strip(),
+            WEBSITE_URL,
             data={"action": "load_all"},
             timeout=25,
             impersonate="chrome124"
@@ -99,7 +153,7 @@ def fetch_all_live_rooms():
         try:
             res = session.get(url, headers=headers, timeout=20)
             if res.status_code != 200:
-                print(f"⚠️️ Batch {page_num} stopped (HTTP {res.status_code}).")
+                print(f"⚠️ Batch {page_num} stopped (HTTP {res.status_code}).")
                 break
 
             data = res.json()
@@ -132,10 +186,9 @@ def fetch_all_live_rooms():
 # ==========================================
 # 3. POST TELEMETRY BACK TO WEBSITE
 # ==========================================
-def sync_payload_to_website(payload):
+def sync_payload_to_website(session, payload):
     """Sends matched status telemetry to website sync_tracker endpoint."""
     print(f"\n📡 Syncing telemetry for {len(payload)} streamers to website database...")
-    session = requests.Session()
     
     post_data = {
         "action": "sync_tracker",
@@ -145,7 +198,7 @@ def sync_payload_to_website(payload):
 
     try:
         res = session.post(
-            WEBSITE_URL.strip(),
+            WEBSITE_URL,
             data=post_data,
             timeout=30,
             impersonate="chrome124"
@@ -175,8 +228,12 @@ def main():
     print("🎯 LIVE LOUNGE AUTO-SYNC TRACKER ENGINE")
     print("=" * 70)
 
+    # Initialize shared website session & unlock InfinityFree
+    website_session = requests.Session()
+    bypass_infinityfree_firewall(website_session, WEBSITE_URL)
+
     # Step 1: Target Streamers from Website
-    target_list = fetch_saved_streamers_from_website()
+    target_list = fetch_saved_streamers_from_website(website_session)
     if not target_list:
         print("❌ No target streamers found. Exiting.")
         return
@@ -224,7 +281,7 @@ def main():
             })
 
     # Step 4: Push to Website Database
-    sync_payload_to_website(payload_for_website)
+    sync_payload_to_website(website_session, payload_for_website)
 
     # Step 5: Terminal Summary
     print("=" * 70)
