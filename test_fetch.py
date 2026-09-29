@@ -2,7 +2,6 @@ import urllib.request
 import json
 import time
 
-# Apnar library theke kichu model er nam check korar jonno
 TEST_MODELS = [
     "_stayhere",
     "taisia_hot",
@@ -30,10 +29,32 @@ try:
         all_rooms = json.loads(raw_data.decode('utf-8'))
 
     fetch_duration = round(time.time() - start_time, 2)
-    print(f"✅ Success! Total online rooms fetched: {len(all_rooms)} in {fetch_duration}s\n")
+
+    # Dictionary vs List Auto-handling
+    if isinstance(all_rooms, dict):
+        print(f"[DEBUG] API returned dictionary with keys: {list(all_rooms.keys())}")
+        rooms = (
+            all_rooms.get('results') or 
+            all_rooms.get('rooms') or 
+            all_rooms.get('data') or 
+            []
+        )
+    elif isinstance(all_rooms, list):
+        rooms = all_rooms
+    else:
+        rooms = []
+
+    print(f"✅ Success! Total live rooms extracted: {len(rooms)} in {fetch_duration}s\n")
+
+    if rooms and isinstance(rooms[0], dict):
+        sample = rooms[0]
+        print(f"[SAMPLE ROOM KEYS]: {list(sample.keys())[:8]}...")
 
     # Fast In-Memory Map
-    online_dict = {room['username'].lower(): room for room in all_rooms}
+    online_dict = {}
+    for r in rooms:
+        if isinstance(r, dict) and 'username' in r:
+            online_dict[r['username'].lower()] = r
 
     print("-" * 65)
     print("📊 TARGET STREAMERS TELEMETRY REPORT")
@@ -67,4 +88,4 @@ try:
 
 except Exception as e:
     print(f"❌ Error fetching Chaturbate feed: {e}")
-  
+    
