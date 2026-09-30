@@ -8,8 +8,8 @@ import os
 import html as html_lib
 from urllib.parse import urlparse
 
-# Auto check for curl_cffi and cryptography
-for pkg in ["curl_cffi", "cryptography"]:
+# Auto check for curl_cffi, cryptography and pywebpush
+for pkg in ["curl_cffi", "cryptography", "pywebpush"]:
     try:
         __import__(pkg)
     except ImportError:
@@ -18,6 +18,7 @@ for pkg in ["curl_cffi", "cryptography"]:
 from curl_cffi import requests
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.backends import default_backend
+from pywebpush import webpush, WebPushException
 
 # ==========================================
 # CONFIGURATION & SETTINGS
@@ -27,6 +28,10 @@ TRACKER_SECRET_KEY = "jitul_tracker_key_2026"
 
 WORKER_URL = "https://cb-feed-proxy.jiakailena.workers.dev"
 CLOUDFLARE_KEY = "jitul_tracker_key_2026"
+
+# VAPID Keys for Background Web Push
+VAPID_PRIVATE_KEY = "2-2o1-oC0G9S4lP3_ih7XFXDeOM8DTyvY7Jt8RVt4nE"
+VAPID_CLAIMS = {"sub": "mailto:admin@infinityfree.com"}
 
 # ==========================================
 # HELPER FUNCTIONS
@@ -52,6 +57,50 @@ def clean_subject(raw: str) -> str:
     raw = html_lib.unescape(raw)
     raw = raw.replace('\\"', '"').replace('\\/', '/')
     return re.sub(r'\s+', ' ', raw).strip()
+
+def send_web_push_alerts(newly_live_streamers, subscriptions):
+    """Sends background Web Push to all registered device tokens"""
+    if not newly_live_streamers or not subscriptions:
+        return
+
+    print(f"\n🔔 [PUSH] Triggering background push for {len(newly_live_streamers)} newly live streamer(s)...")
+
+    for streamer in newly_live_streamers:
+        payload = json.dumps({
+            "title": f"⭐ {streamer.upper()} is LIVE!",
+            "body": "Streamer started broadcasting. Tap to watch now!",
+            "url": WEBSITE_URL
+        })
+
+        for sub in subscriptions:
+            endpoint = sub.get("endpoint", "")
+            p256dh = sub.get("p256dh", "")
+            auth = sub.get("auth", "")
+
+            if not endpoint or not p256dh or not auth:
+                continue
+
+            sub_info = {
+                "endpoint": endpoint,
+                "keys": {
+                    "p256dh": p256dh,
+                    "auth": auth
+                }
+            }
+
+            try:
+                webpush(
+                    subscription_info=sub_info,
+                    data=payload,
+                    vapid_private_key=VAPID_PRIVATE_KEY,
+                    vapid_claims=VAPID_CLAIMS,
+                    timeout=10
+                )
+                print(f"  ✅ Push delivered to device: {endpoint[:45]}...")
+            except WebPushException as ex:
+                print(f"  ❌ WebPush delivery failed: {ex}")
+            except Exception as e:
+                print(f"  ❌ Unexpected Push error: {e}")
 
 # ==========================================
 # INFINITYFREE BYETHOST AES CHALLENGE SOLVER
@@ -205,6 +254,13 @@ def sync_payload_to_website(session, online_payload, total_targets_count):
                 ret = res.json()
                 if ret.get("success"):
                     print(f"🎉 WEBSITE SYNC SUCCESS! Active online synced: {ret.get('online_synced', len(online_payload))} streamers.")
+                    
+                    # Trigger background web push if any streamer just went live
+                    newly_live = ret.get("newly_live", [])
+                    subscriptions = ret.get("subscriptions", [])
+                    if newly_live and subscriptions:
+                        send_web_push_alerts(newly_live, subscriptions)
+                    
                     return True
                 else:
                     print(f"❌ Website rejected sync: {ret.get('message')}")
@@ -249,7 +305,6 @@ def main():
             room = online_map[target_name]
             raw_show = str(room.get('current_show', 'public')).lower()
 
-            # Align status with stream.php & app.js: 'public', 'private', 'others'
             if raw_show in ['private', 'ticket_show', 'vip']:
                 status = 'private'
             elif raw_show in ['away', 'hidden', 'group_show', 'club_show']:
@@ -267,7 +322,7 @@ def main():
                 "subject": subj
             })
 
-    # Step 4: Push ONLY Online Streamers (Database bulk query handles offlines in 0.005s)
+    # Step 4: Push ONLY Online Streamers & Dispatch Alerts
     sync_payload_to_website(website_session, online_payload, len(target_list))
 
     # Step 5: Terminal Summary
