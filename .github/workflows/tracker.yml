@@ -18,11 +18,10 @@ jobs:
           python-version: '3.11'
 
       - name: Install Dependencies
-        run: pip install requests curl_cffi cryptography
+        run: pip install requests curl_cffi cryptography pywebpush
 
       - name: Run Tracker
         env:
           WEBSITE_API_URL: ${{ secrets.WEBSITE_API_URL }}
           TRACKER_SYNC_KEY: ${{ secrets.TRACKER_SYNC_KEY }}
         run: python tracker.py
-        
