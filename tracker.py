@@ -59,17 +59,20 @@ def clean_subject(raw: str) -> str:
     return re.sub(r'\s+', ' ', raw).strip()
 
 def send_web_push_alerts(newly_live_streamers, subscriptions):
-    """Sends background Web Push to all registered device tokens"""
+    """Sends background Web Push to all registered device tokens with direct auto-play URL"""
     if not newly_live_streamers or not subscriptions:
         return
 
     print(f"\n🔔 [PUSH] Triggering background push for {len(newly_live_streamers)} newly live streamer(s)...")
 
     for streamer in newly_live_streamers:
+        # Direct auto-play & auto-select URL
+        direct_play_url = f"{WEBSITE_URL}?play={streamer}"
+        
         payload = json.dumps({
             "title": f"⭐ {streamer.upper()} is LIVE!",
-            "body": "Streamer started broadcasting. Tap to watch now!",
-            "url": WEBSITE_URL
+            "body": f"{streamer} started broadcasting. Tap to watch now!",
+            "url": direct_play_url
         })
 
         for sub in subscriptions:
@@ -96,7 +99,7 @@ def send_web_push_alerts(newly_live_streamers, subscriptions):
                     vapid_claims=VAPID_CLAIMS,
                     timeout=10
                 )
-                print(f"  ✅ Push delivered to device: {endpoint[:45]}...")
+                print(f"  ✅ Push delivered to device for [{streamer}]: {endpoint[:45]}...")
             except WebPushException as ex:
                 print(f"  ❌ WebPush delivery failed: {ex}")
             except Exception as e:
@@ -106,9 +109,7 @@ def send_web_push_alerts(newly_live_streamers, subscriptions):
 # INFINITYFREE BYETHOST AES CHALLENGE SOLVER
 # ==========================================
 def bypass_infinityfree_firewall(session, target_url: str):
-    """
-    Solves InfinityFree / ByetHost aes.js challenge and injects __test cookie.
-    """
+    """Solves InfinityFree / ByetHost aes.js challenge and injects __test cookie."""
     print("🛡️ Checking InfinityFree bot security challenge...")
     try:
         res = session.get(target_url, impersonate="chrome124", timeout=20)
@@ -255,7 +256,7 @@ def sync_payload_to_website(session, online_payload, total_targets_count):
                 if ret.get("success"):
                     print(f"🎉 WEBSITE SYNC SUCCESS! Active online synced: {ret.get('online_synced', len(online_payload))} streamers.")
                     
-                    # Trigger background web push if any streamer just went live
+                    # Trigger background web push with direct link
                     newly_live = ret.get("newly_live", [])
                     subscriptions = ret.get("subscriptions", [])
                     if newly_live and subscriptions:
