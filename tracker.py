@@ -59,7 +59,6 @@ def clean_subject(raw: str) -> str:
 def bypass_infinityfree_firewall(session, target_url: str):
     """
     Solves InfinityFree / ByetHost aes.js challenge and injects __test cookie.
-    Guarantees subsequent GET/POST requests pass straight to stream.php.
     """
     print("🛡️ Checking InfinityFree bot security challenge...")
     try:
@@ -80,7 +79,6 @@ def bypass_infinityfree_firewall(session, target_url: str):
                 dec = cipher.decryptor()
                 cookie_val = (dec.update(ct) + dec.finalize()).hex()
 
-                # Attach cookie to session headers and cookie jar
                 session.headers["Cookie"] = f"__test={cookie_val}"
                 try:
                     domain = urlparse(target_url).netloc
@@ -89,8 +87,6 @@ def bypass_infinityfree_firewall(session, target_url: str):
                     pass
 
                 print(f"🔓 Solved InfinityFree Challenge! (__test={cookie_val[:8]}...)")
-
-                # Clearance verification knock
                 verify_res = session.get(target_url, impersonate="chrome124", timeout=20)
                 if "aes.js" not in verify_res.text:
                     print("✅ Security cleared! Server is ready to process requests.")
@@ -184,16 +180,17 @@ def fetch_all_live_rooms():
     return all_rooms
 
 # ==========================================
-# 3. POST TELEMETRY BACK TO WEBSITE
+# 3. POST ONLY ONLINE TELEMETRY TO WEBSITE
 # ==========================================
-def sync_payload_to_website(session, payload):
-    """Sends matched status telemetry to website sync_tracker endpoint."""
-    print(f"\n📡 Syncing telemetry for {len(payload)} streamers to website database...")
+def sync_payload_to_website(session, online_payload, total_targets_count):
+    """Sends ONLY online streamers with total count for ultra-fast sync."""
+    print(f"\n📡 Pushing {len(online_payload)} live streamers (out of {total_targets_count}) to website database...")
     
     post_data = {
         "action": "sync_tracker",
         "secret": TRACKER_SECRET_KEY,
-        "payload": json.dumps(payload, ensure_ascii=False)
+        "total_targets": total_targets_count,
+        "payload": json.dumps(online_payload, ensure_ascii=False)
     }
 
     try:
@@ -207,7 +204,7 @@ def sync_payload_to_website(session, payload):
             try:
                 ret = res.json()
                 if ret.get("success"):
-                    print(f"🎉 WEBSITE SYNC SUCCESS! Updated: {ret.get('updated', len(payload))} streamers.")
+                    print(f"🎉 WEBSITE SYNC SUCCESS! Active online synced: {ret.get('online_synced', len(online_payload))} streamers.")
                     return True
                 else:
                     print(f"❌ Website rejected sync: {ret.get('message')}")
@@ -225,7 +222,7 @@ def sync_payload_to_website(session, payload):
 # ==========================================
 def main():
     print("=" * 70)
-    print("🎯 LIVE LOUNGE AUTO-SYNC TRACKER ENGINE")
+    print("🎯 LIVE LOUNGE AUTO-SYNC TRACKER ENGINE (BULK OPTIMIZED)")
     print("=" * 70)
 
     # Initialize shared website session & unlock InfinityFree
@@ -245,9 +242,7 @@ def main():
     print("\n⚡ Matching targets against live platform data...")
     online_map = {clean_model_name(r.get('username', '')): r for r in global_rooms if r.get('username')}
 
-    payload_for_website = []
-    live_count = 0
-
+    online_payload = []
     for target in target_list:
         target_name = clean_model_name(target)
         if target_name in online_map:
@@ -265,32 +260,23 @@ def main():
             subj = clean_subject(room.get('room_subject', ''))
             viewers = int(room.get('num_users', 0))
 
-            payload_for_website.append({
+            online_payload.append({
                 "name": target_name,
                 "status": status,
                 "viewers": viewers,
                 "subject": subj
             })
-            live_count += 1
-        else:
-            payload_for_website.append({
-                "name": target_name,
-                "status": "offline",
-                "viewers": 0,
-                "subject": ""
-            })
 
-    # Step 4: Push to Website Database
-    sync_payload_to_website(website_session, payload_for_website)
+    # Step 4: Push ONLY Online Streamers (Database bulk query handles offlines in 0.005s)
+    sync_payload_to_website(website_session, online_payload, len(target_list))
 
     # Step 5: Terminal Summary
     print("=" * 70)
     print(f"📊 SUMMARY:")
     print(f"● Total Target Streamers : {len(target_list)}")
-    print(f"● Currently Online       : {live_count}")
-    print(f"● Currently Offline      : {len(target_list) - live_count}")
+    print(f"● Currently Online       : {len(online_payload)}")
+    print(f"● Currently Offline      : {len(target_list) - len(online_payload)}")
     print("=" * 70)
 
 if __name__ == "__main__":
     main()
-    
