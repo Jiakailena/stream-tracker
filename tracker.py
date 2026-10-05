@@ -23,8 +23,8 @@ from pywebpush import webpush, WebPushException
 # ==========================================
 # CONFIGURATION & SETTINGS
 # ==========================================
-WEBSITE_URL = "https://stacy.infinityfreeapp.com/stream.php"
-TRACKER_SECRET_KEY = "jitul_tracker_key_2026"
+WEBSITE_URL = os.getenv("WEBSITE_API_URL", "https://yluismag.duckdns.org/stream.php")
+TRACKER_SECRET_KEY = os.getenv("TRACKER_SYNC_KEY", "jitul_tracker_key_2026")
 
 WORKER_URL = "https://cb-feed-proxy.jiakailena.workers.dev"
 CLOUDFLARE_KEY = "jitul_tracker_key_2026"
@@ -66,7 +66,6 @@ def send_web_push_alerts(newly_live_streamers, subscriptions):
     print(f"\n🔔 [PUSH] Triggering background push for {len(newly_live_streamers)} newly live streamer(s)...")
 
     for streamer in newly_live_streamers:
-        # Deep link that triggers auto-select and auto-play in app.js
         direct_play_url = f"{WEBSITE_URL}?play={streamer}"
         
         payload = json.dumps({
@@ -106,54 +105,11 @@ def send_web_push_alerts(newly_live_streamers, subscriptions):
                 print(f"  ❌ Unexpected Push error: {e}")
 
 # ==========================================
-# INFINITYFREE BYETHOST AES CHALLENGE SOLVER
-# ==========================================
-def bypass_infinityfree_firewall(session, target_url: str):
-    """Solves InfinityFree / ByetHost aes.js challenge and injects __test cookie."""
-    print("🛡️ Checking InfinityFree bot security challenge...")
-    try:
-        res = session.get(target_url, impersonate="chrome124", timeout=20)
-        html = res.text
-
-        if "aes.js" in html or "toNumbers" in html:
-            ma = re.search(r'a\s*=\s*toNumbers\(["\']([0-9a-fA-F]+)["\']\)', html)
-            mb = re.search(r'b\s*=\s*toNumbers\(["\']([0-9a-fA-F]+)["\']\)', html)
-            mc = re.search(r'c\s*=\s*toNumbers\(["\']([0-9a-fA-F]+)["\']\)', html)
-
-            if ma and mb and mc:
-                key = bytes.fromhex(ma.group(1))
-                iv = bytes.fromhex(mb.group(1))
-                ct = bytes.fromhex(mc.group(1))
-
-                cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())
-                dec = cipher.decryptor()
-                cookie_val = (dec.update(ct) + dec.finalize()).hex()
-
-                session.headers["Cookie"] = f"__test={cookie_val}"
-                try:
-                    domain = urlparse(target_url).netloc
-                    session.cookies.set("__test", cookie_val, domain=domain)
-                except Exception:
-                    pass
-
-                print(f"🔓 Solved InfinityFree Challenge! (__test={cookie_val[:8]}...)")
-                verify_res = session.get(target_url, impersonate="chrome124", timeout=20)
-                if "aes.js" not in verify_res.text:
-                    print("✅ Security cleared! Server is ready to process requests.")
-                return True
-        else:
-            print("✅ Direct connection open (No security challenge triggered).")
-            return True
-    except Exception as e:
-        print(f"⚠️ Firewall check exception: {e}")
-    return False
-
-# ==========================================
 # 1. FETCH TARGETS (10K SCALE LIGHTWEIGHT API)
 # ==========================================
 def fetch_saved_streamers_from_website(session):
     """Fetches streamer targets using lightweight endpoint (handles 10k in <0.1s)."""
-    print("🌐 Connecting to website to fetch saved streamer targets...")
+    print(f"🌐 Connecting to {WEBSITE_URL} to fetch saved streamer targets...")
     try:
         res = session.post(
             WEBSITE_URL,
@@ -168,7 +124,6 @@ def fetch_saved_streamers_from_website(session):
                 print(f"✅ Successfully loaded {len(targets)} saved streamers from website database!")
                 return targets
 
-        # Fallback to load_all for backward compatibility
         res = session.post(
             WEBSITE_URL,
             data={"action": "load_all"},
@@ -228,7 +183,6 @@ def fetch_all_live_rooms():
             offset += batch_size
             page_num += 1
 
-            # Dynamic Random Jitter (0.30s to 0.40s)
             time.sleep(round(random.uniform(0.30, 0.40), 3))
 
         except Exception as e:
@@ -266,7 +220,6 @@ def sync_payload_to_website(session, online_payload, total_targets_count):
                 if ret.get("success"):
                     print(f"🎉 WEBSITE SYNC SUCCESS! Active online synced: {ret.get('online_synced', len(online_payload))} streamers.")
                     
-                    # Background Web Push execution
                     newly_live = ret.get("newly_live", [])
                     subscriptions = ret.get("subscriptions", [])
                     if newly_live and subscriptions:
@@ -292,9 +245,7 @@ def main():
     print("🎯 LIVE LOUNGE AUTO-SYNC TRACKER ENGINE (10K SCALE OPTIMIZED)")
     print("=" * 70)
 
-    # Initialize session and bypass InfinityFree challenge
     website_session = requests.Session()
-    bypass_infinityfree_firewall(website_session, WEBSITE_URL)
 
     # Step 1: Lightweight Target Fetching
     target_list = fetch_saved_streamers_from_website(website_session)
@@ -305,7 +256,7 @@ def main():
     # Step 2: Global Live Rooms from Cloudflare
     global_rooms = fetch_all_live_rooms()
 
-    # Step 3: Fast In-Memory Map (O(1) lookup handles 10k streamers in 0.001s)
+    # Step 3: Fast In-Memory Map
     print("\n⚡ Matching targets against live platform data...")
     online_map = {clean_model_name(r.get('username', '')): r for r in global_rooms if r.get('username')}
 
