@@ -96,6 +96,7 @@ def send_web_push_alerts(newly_live_streamers, subscriptions):
                     data=payload,
                     vapid_private_key=VAPID_PRIVATE_KEY,
                     vapid_claims=VAPID_CLAIMS,
+                    ttl=14400,  # 4 ghonta (4 * 3600 seconds) Google FCM server message joma rakhbe
                     timeout=10
                 )
                 print(f"  ✅ Push delivered to device for [{streamer}]: {endpoint[:45]}...")
